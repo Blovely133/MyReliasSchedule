@@ -185,6 +185,92 @@ async function handleGenerate(env, payload) {
   return { analysis: input.analysis || '', notes, targets, usage };
 }
 
+/* ---- /api/review: adversarial review of a proposed schedule ---- */
+
+const REVIEW_TOOL = {
+  name: 'emit_schedule_review',
+  description: 'Adversarially review the proposed schedule and report concrete, data-verifiable problems with fixes.',
+  input_schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['verdict', 'summary', 'flags', 'fixes'],
+    properties: {
+      verdict: { type: 'string', enum: ['clean', 'issues'] },
+      summary: { type: 'string', description: 'One or two sentences: overall judgment of this schedule.' },
+      flags: {
+        type: 'array',
+        description: 'Concrete problems found. Empty if the schedule is clean.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['severity', 'issue'],
+          properties: {
+            severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+            issue: { type: 'string', description: 'The specific problem, with names/dates/numbers from the data.' },
+            who: { type: 'string' },
+            date: { type: 'string' },
+          },
+        },
+      },
+      fixes: {
+        type: 'array',
+        description: 'Operations that would fix the flags. Same schema as the chat ops.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['kind'],
+          properties: {
+            kind: { type: 'string', enum: ['addProvider', 'removeProvider', 'addOff', 'addPrefer', 'setCap', 'setTarget', 'setTimeOfDay', 'maxRun', 'move'] },
+            who: { type: 'string' },
+            role: { type: 'string', enum: ['PHY', 'APC'] },
+            target: { type: 'integer' },
+            value: { type: 'integer' },
+            tod: { type: 'string', enum: ['day', 'eve', 'night'] },
+            dates: { type: 'array', items: { type: 'string' } },
+            toWho: { type: 'string' },
+            date: { type: 'string' },
+          },
+        },
+      },
+    },
+  },
+};
+
+async function handleReview(env, payload) {
+  const { site, siteName, month, round, rules, providers, assignments, unfilled, priorFlags } = payload;
+  const system = [
+    `You are an ADVERSARIAL schedule reviewer for ${siteName || site}, ${month} (review round ${round}). Your job is to find real problems in this proposed schedule, not to praise it.`,
+    `Hunt specifically for: providers ending below their average minus one (floor violations); anyone above target+1; shifts with under 10 hours rest between them (a shift's end to the next day's start, overnights end next morning); night-pattern people given day shifts or vice versa; runs longer than the max consecutive rule; unfair spreads between similar providers; preferred days that were skipped while that day's shift went to someone with no preference; open shifts a listed provider could legally take.`,
+    `Every flag must cite names, dates, or numbers VERIFIABLE from the data given. Do not invent issues; do not pad. If the schedule genuinely holds up, return verdict "clean" with zero flags — a clean verdict from a hostile reviewer is meaningful. Your summary MUST agree with your flags: zero flags means the summary says the schedule held up; never describe problems you did not flag.`,
+    `For each flag propose the smallest concrete fix as an operation (move a specific shift, adjust a target/cap, set time-of-day). Use exact full provider names. Only propose moves to providers who are eligible (right role, not on an off day, respects rest).`,
+    priorFlags && priorFlags.length ? `Flags from the previous round (verify they are actually resolved; re-flag if not): ${priorFlags.join(' | ')}` : '',
+    `Rules in force: ${rules}`,
+  ].filter(Boolean).join('\n\n');
+  const userText = [
+    `Providers (name — role; target; days assigned incl. existing; floor=target-1; usual time of day; off days; preferred days; cap):`,
+    ...(providers || []),
+    ``,
+    `Assignments (date start–end position → provider):`,
+    ...(assignments || []),
+    ``,
+    unfilled && unfilled.length ? `Still open: ${unfilled.join(', ')}` : 'No open slots remain.',
+  ].join('\n');
+  const { input, usage } = await callClaude(env, {
+    system,
+    userText,
+    tool: REVIEW_TOOL,
+    maxTokens: 4096,
+    effort: 'max',
+  });
+  return {
+    verdict: input.verdict || 'issues',
+    summary: input.summary || '',
+    flags: Array.isArray(input.flags) ? input.flags : [],
+    fixes: Array.isArray(input.fixes) ? input.fixes : [],
+    usage,
+  };
+}
+
 /* ---- router ---- */
 
 export default {
@@ -221,6 +307,7 @@ export default {
     try {
       if (url.pathname === '/api/chat') return json(await handleChat(env, payload), 200, origin);
       if (url.pathname === '/api/generate') return json(await handleGenerate(env, payload), 200, origin);
+      if (url.pathname === '/api/review') return json(await handleReview(env, payload), 200, origin);
       return json({ error: 'not_found' }, 404, origin);
     } catch (err) {
       return json({ error: 'upstream', message: String(err.message || err) }, 502, origin);
