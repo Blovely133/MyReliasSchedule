@@ -1164,6 +1164,35 @@ function slotRole(pos) {
   return 'ANY';
 }
 
+/* time-of-day bucket for a shift: days start before noon, evenings 12:00–17:59,
+   nights start 18:00+ or run overnight */
+function shiftBucket(s) {
+  if (isNight(s)) return 'night';
+  return s.start >= '12:00' ? 'eve' : 'day';
+}
+
+/* each provider's historical shift-time mix, from every assigned shift in the
+   import — a night doc's profile is {night: ~100%} */
+function timeProfiles() {
+  const map = new Map();
+  for (const s of base) {
+    if (s.forecast || !s.who) continue;
+    if (!map.has(s.who)) map.set(s.who, { total: 0, day: 0, eve: 0, night: 0 });
+    const t = map.get(s.who);
+    t.total++;
+    t[shiftBucket(s)]++;
+  }
+  return map;
+}
+
+function usualShift(prof) {
+  if (!prof || prof.total < 4) return '—';
+  const fr = b => prof[b] / prof.total;
+  const best = ['night', 'eve', 'day'].sort((a, b) => fr(b) - fr(a))[0];
+  if (fr(best) < 0.65) return 'mixed';
+  return `${{ night: 'nights', eve: 'evenings', day: 'days' }[best]} (${Math.round(fr(best) * 100)}%)`;
+}
+
 const expandDays = (mo, nums) => (nums || []).map(n => `${mo}-${String(n).padStart(2, '0')}`);
 const moShort = mo => {
   const [y, m] = mo.split('-').map(Number);
@@ -1258,7 +1287,8 @@ function runGeneration(site, mo) {
   const skipped = openHere.length - slots.length;
   const pool = poolFor(site, mo);
   const reqs = requestsFor(site, mo);
-  const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set() }]));
+  const profiles = timeProfiles();
+  const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), prof: profiles.get(p.who) || null }]));
   const overnights = new Map();
   const markOvernight = (who, date) => {
     if (!overnights.has(who)) overnights.set(who, new Set());
@@ -1288,7 +1318,10 @@ function runGeneration(site, mo) {
       let run = 0;
       for (let k = 1; k <= 5; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
       if (run >= 5) continue;                                                    // hard: max 5 consecutive days
+      const bucket = shiftBucket(slot);
+      if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
       let score = 0;
+      if (st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
       if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
       if (st.dates.has(addDays(slot.date, -1))) score += 45;                     // build blocks
       score += p.float ? -8 : 12;                                                // regulars first
@@ -1488,7 +1521,7 @@ function renderGenerate(main) {
   const intro = el('div', 'reqform genintro');
   intro.append(el('h2', '', '✨ AI schedule generation'));
   intro.append(el('div', 'reqhint',
-    'Collect requests → reconcile → draft → publish. The reconciliation engine runs live in this browser — days off are never violated, caps and rest rules hold, blocks stay together, and each provider is targeted at their own average days worked over the last three months. In production the same loop runs through Claude\'s API, including emailing providers to collect requests and sending everyone their schedule.'));
+    'Collect requests → reconcile → draft → publish. The reconciliation engine runs live in this browser — days off are never violated, caps and rest rules hold, blocks stay together, night people stay on nights (time-of-day is learned from each provider\'s history), and each provider is targeted at their own average days worked over the last three months. In production the same loop runs through Claude\'s API, including emailing providers to collect requests and sending everyone their schedule.'));
   wrap.append(intro);
 
   /* controls */
@@ -1577,6 +1610,11 @@ function renderGenerate(main) {
     bullet(`Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
     const avgEx = [...res.stats.values()].filter(s => s.fromAvg && s.assigned).sort((a, b) => b.assigned - a.assigned)[0];
     bullet(`Each provider's target is their own average days worked per month, June–August${avgEx ? ` — e.g., ${avgEx.who.replace(/,.*$/, '')} averages ${avgEx.avg.toFixed(1)} days/month and is proposed for ${avgEx.assigned}` : ''}.`);
+    const nightEx = [...res.stats.values()].find(s => {
+      if (!s.assigned || !s.prof || s.prof.total < 8 || s.prof.night / s.prof.total < 0.9) return false;
+      return res.assignments.filter(a => a.who === s.who).every(a => shiftBucket(a.slot) === 'night');
+    });
+    bullet(`Everyone keeps their usual time of day, learned from their history — a near-exclusive pattern is a hard rule, not a suggestion${nightEx ? ` (e.g., ${nightEx.who.replace(/,.*$/, '')} is ${Math.round(nightEx.prof.night / nightEx.prof.total * 100)}% nights historically and drew only night shifts)` : ''}.`);
     if (res.unfilled.length > 15) bullet(`Coverage gap: roughly ${Math.ceil(res.unfilled.length / 13)} more full-time providers are needed to fully cover ${siteName(res.site)} — a concrete number for recruiting.`);
     bullet(`Every requested day off was honored — the engine treats “unavailable” as a hard rule, never a suggestion.`);
     if (res.preferTotal) bullet(`${res.preferGot} of ${res.preferTotal} preferred days granted; the misses lost out to load balancing or one-shift-per-day.`);
@@ -1594,7 +1632,7 @@ function renderGenerate(main) {
     const provBox = el('div', 'reqform');
     provBox.append(el('h2', '', 'Proposed load by provider'));
     const pt = el('table', 'flat');
-    pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Assigned</th><th>Target (3-mo avg)</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
+    pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Usual shift</th><th>Assigned</th><th>Target (3-mo avg)</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
     const ptb = el('tbody');
     let anyPlanned = false;
     for (const s of [...res.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned)) {
@@ -1603,6 +1641,7 @@ function renderGenerate(main) {
       if (s.float) tdN.append(el('span', 'floatpill', 'float'));
       tr.append(tdN);
       tr.append(el('td', '', s.role));
+      tr.append(el('td', '', usualShift(s.prof)));
       tr.append(el('td', '', String(s.assigned)));
       if (s.fromAvg) {
         tr.append(el('td', '', `${s.target} (avg ${s.avg.toFixed(1)})`));
