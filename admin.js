@@ -31,7 +31,7 @@ let state = {
   focusDay: null,       // set by a coverage-cell click; highlighted in the Builder grid
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
-  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set() },
+  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null },
 };
 
 /* Site codes → full facility names, from WhenToWork's category list */
@@ -1354,8 +1354,8 @@ function runGeneration(site, mo) {
       const st = stats.get(p.who);
       const r = reqs.get(p.who);
       if (r && r.off.has(slot.date)) continue;                                   // hard: unavailable
-      const cap = (r && r.cap) || p.target + 3;
-      if (st.assigned >= cap) { if (r && r.cap) capsHit.add(p.who); continue; }  // hard: shift cap
+      const cap = (r && r.cap) || p.target + 1;                                  // hard: never more than 1 over their average/target
+      if (st.assigned >= cap) { if (r && r.cap) capsHit.add(p.who); continue; }
       if (st.dates.has(slot.date)) continue;                                     // hard: one shift/day
       if (slot.start < '12:00' && overnights.get(p.who)?.has(addDays(slot.date, -1))) continue;  // hard: rest after overnight
       let run = 0;
@@ -1734,27 +1734,37 @@ function renderScheduleChat(wrap) {
 
 /* month-calendar preview of a generated proposal (read-only) */
 function renderProposalCalendar(wrap, res) {
+  const rf = state.gen.roleFilter;
   const box = el('div', 'reqform');
-  box.append(el('h2', '', `Proposed schedule — ${siteName(res.site)}, ${fmtMonth(res.mo)}`));
+  box.append(el('h2', '', `Proposed schedule — ${siteName(res.site)}, ${fmtMonth(res.mo)}${rf ? (rf === 'PHY' ? ' — physicians only' : ' — APCs only') : ''}`));
   const legend = el('div', 'preflegend');
-  legend.append(el('span', 'chip mini2 role-phy legendchip', 'physician'));
-  legend.append(el('span', 'chip mini2 role-apc legendchip', 'APC'));
+  const roleBtn = (role, label, cls) => {
+    const b = el('button', 'chip mini2 legendchip clickable ' + cls + (rf === role ? ' on' : ''), label + (rf === role ? ' ✓' : ''));
+    b.type = 'button';
+    b.title = rf === role ? 'Show everyone again' : `Show only the ${label.replace(/s$/, '')} schedule`;
+    b.onclick = () => { state.gen.roleFilter = rf === role ? null : role; render(); };
+    return b;
+  };
+  legend.append(roleBtn('PHY', 'physicians', 'role-phy'));
+  legend.append(roleBtn('APC', 'APCs', 'role-apc'));
   legend.append(el('span', 'chip mini2 open legendchip', 'still OPEN'));
   const pm = el('span', 'chip mini2 legendchip');
   pm.append(document.createTextNode('name '));
   pm.append(el('span', 'prefmark', '✓'));
   pm.append(document.createTextNode(' = preferred day granted'));
   legend.append(pm);
+  legend.append(el('span', '', 'Click physicians or APCs to filter the view.'));
   box.append(legend);
 
+  const keep = slot => !rf || slotRole(slot.pos) === rf || slotRole(slot.pos) === 'ANY';
   const byDay = new Map();
   const put = it => {
     const d = it.slot.date;
     if (!byDay.has(d)) byDay.set(d, []);
     byDay.get(d).push(it);
   };
-  for (const a of res.assignments) put({ slot: a.slot, who: a.who, preferred: a.preferred });
-  for (const s of res.unfilled) put({ slot: s, who: '', preferred: false });
+  for (const a of res.assignments) if (keep(a.slot)) put({ slot: a.slot, who: a.who, preferred: a.preferred });
+  for (const s of res.unfilled) if (keep(s)) put({ slot: s, who: '', preferred: false });
 
   const [y, m] = res.mo.split('-').map(Number);
   const table = el('table', 'bigcal');
@@ -1908,6 +1918,7 @@ function renderGenerate(main) {
     bullet(`Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
     const avgEx = [...res.stats.values()].filter(s => s.fromAvg && s.assigned).sort((a, b) => b.assigned - a.assigned)[0];
     bullet(`Each provider's target is their own average days worked per month, June–August${avgEx ? ` — e.g., ${avgEx.who.replace(/,.*$/, '')} averages ${avgEx.avg.toFixed(1)} days/month and is proposed for ${avgEx.assigned}` : ''}.`);
+    bullet('Hard fairness rail: nobody is scheduled more than one shift above their average/target — requests shape which days you work, not how many.');
     const nightEx = [...res.stats.values()].find(s => {
       if (!s.assigned || !s.prof || s.prof.total < 8 || s.prof.night / s.prof.total < 0.9) return false;
       return res.assignments.filter(a => a.who === s.who).every(a => shiftBucket(a.slot) === 'night');
@@ -1933,7 +1944,8 @@ function renderGenerate(main) {
     pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Usual shift</th><th>Assigned</th><th>Target (3-mo avg)</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
     const ptb = el('tbody');
     let anyPlanned = false;
-    for (const s of [...res.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned)) {
+    const rfNow = state.gen.roleFilter;
+    for (const s of [...res.stats.values()].filter(s => s.assigned && (!rfNow || s.role === rfNow || s.role === 'ANY')).sort((a, b) => b.assigned - a.assigned)) {
       const tr = el('tr');
       const tdN = el('td', '', s.who);
       if (s.float) tdN.append(el('span', 'floatpill', 'float'));

@@ -307,6 +307,9 @@ table.flat th.sorted { color: var(--rh-yellow); }
 .prefmark { color: #4ee6a8; font-weight: 800; }
 .chip.proposal { cursor: default; }
 .chip.proposal:hover { filter: none; }
+.legendchip.clickable { cursor: pointer; }
+.legendchip.clickable:hover { filter: brightness(1.25); }
+.legendchip.on { outline: 2px solid var(--rh-yellow); outline-offset: -1px; font-weight: 700; }
 
 /* ---- talk to the schedule ---- */
 .genchat .chatlog {
