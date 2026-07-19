@@ -1471,11 +1471,37 @@ function siteAvgDays(site) {
   return avg;
 }
 
+/* who actually worked at this facility in the last 3 real-data months before
+   the generation month — anyone else is stale HERE and stays off the automatic
+   pool (explicit addProvider ops and manual picker assignments still work) */
+function recentAtSite(site, mo) {
+  const months = [...new Set(base.filter(s => !s.forecast && s.who).map(s => s.date.slice(0, 7)))]
+    .filter(m => m < mo).sort().slice(-3);
+  const set = new Set();
+  for (const s of base) {
+    if (s.forecast || !s.who || s.site !== site) continue;
+    if (months.includes(s.date.slice(0, 7))) set.add(s.who);
+  }
+  return set;
+}
+
+/* display helper: who the recency gate dropped from this site's seeded pool */
+function staleDroppedAt(site, mo) {
+  const recent = recentAtSite(site, mo);
+  const ex = EXAMPLE_SCHEDULING[site];
+  const out = new Set();
+  if (ex && ex.month === mo) { for (const [who] of ex.pool) if (!recent.has(who)) out.add(who); }
+  else { for (const [who, h] of siteAvgDays(site)) if (h.avg >= 1 && !recent.has(who)) out.add(who); }
+  for (const a of genAdjustFor(site)) if (a.kind === 'addProvider') out.delete(a.who);
+  return [...out].sort();
+}
+
 function poolFor(site, mo) {
   const avg = siteAvgDays(site);
+  const recent = recentAtSite(site, mo);
   const ex = EXAMPLE_SCHEDULING[site];
   if (ex && ex.month === mo) {
-    return withClaudeTargets(applyPoolAdjust(ex.pool.map(([who, role, seeded, float]) => {
+    return withClaudeTargets(applyPoolAdjust(ex.pool.filter(([who]) => recent.has(who)).map(([who, role, seeded, float]) => {
       const h = avg.get(who);
       /* floats keep their small caps; regulars target their own recent average
          when it's a credible signal (2+ months, 4+ days/mo) — otherwise the
@@ -1485,7 +1511,7 @@ function poolFor(site, mo) {
     }), site), site, mo);
   }
   return withClaudeTargets(applyPoolAdjust([...avg.entries()]
-    .filter(([, h]) => h.avg >= 1)
+    .filter(([who, h]) => h.avg >= 1 && recent.has(who))
     .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false })), site), site, mo);
 }
 
@@ -2905,7 +2931,7 @@ function agentSystemPrompt() {
   return [
     `You are the scheduling copilot for Relias Healthcare's MyReliasSchedule console (currently viewing ${siteName(g.site)}, ${g.month}). The user is the scheduler; help with ANYTHING schedule-related: answer questions, analyze coverage/fairness, and make changes.`,
     `You have full control through your tools. Read before you write: check the schedule/roster with get_schedule/get_providers rather than assuming. Shift edits stage as DRAFTS the staff can't see; tell the user drafts are pending and that they (or you, if they say so) must publish. Only call publish_drafts or discard_drafts when the user explicitly asks.`,
-    `House rules you must respect and can explain: nobody ends a month below their average minus one (PRN exempt); nobody above target+1; ≥10h rest between shifts; one shift/day; max-consecutive-days rule; keep people on their usual time of day; hierarchy full-time > part-time > PRN.`,
+    `House rules you must respect and can explain: nobody ends a month below their average minus one (PRN exempt); nobody above target+1; ≥10h rest between shifts; one shift/day; max-consecutive-days rule; keep people on their usual time of day; hierarchy full-time > part-time > PRN. Providers with no shifts at a facility in the last 3 months are left off its automatic pool (stale there) — proposal_ops addProvider or a manual shift edit overrides that deliberately.`,
     `Schedule placement is done by the HiGHS mixed-integer optimizer (a real MILP solver running in the browser), NOT by you and not by a greedy heuristic — run_generation/proposal_ops invoke it, and its result is provably optimal or near-optimal under the house rules. Never hand-place a whole month shift-by-shift; adjust the inputs (requests, caps, targets, tiers, rules) and re-run the optimizer. Individual swaps/edits via update_shift are fine. The tool result tells you which engine placed the proposal; "greedy fallback" appears only if the solver failed to load.`,
     `Site codes: ${Object.entries(SITE_NAMES).map(([c, n]) => `${c}=${n}`).join(', ')}.`,
     `Be concise and concrete — cite names, dates, and counts from tool results. If a request is ambiguous, ask.`,
@@ -3813,6 +3839,8 @@ function renderGenerate(main) {
     });
     bullet(`Everyone keeps their usual time of day, learned from their history — a near-exclusive pattern is a hard rule, not a suggestion${nightEx ? ` (e.g., ${nightEx.who.replace(/,.*$/, '')} is ${Math.round(nightEx.prof.night / nightEx.prof.total * 100)}% nights historically and drew only night shifts)` : ''}.`);
     if (res.unfilled.length > 15) bullet(`Coverage gap: roughly ${Math.ceil(res.unfilled.length / 13)} more full-time providers are needed to fully cover ${siteName(res.site)} — a concrete number for recruiting.`);
+    const stale = staleDroppedAt(res.site, res.mo);
+    if (stale.length) bullet(`⏸ Left off automatically — no shifts at ${siteName(res.site)} in the last 3 months: ${stale.slice(0, 8).map(n => n.replace(/,.*$/, '')).join(', ')}${stale.length > 8 ? ` +${stale.length - 8} more` : ''}. Re-add anyone via chat/rules (“add provider …”) or place them manually from a slot's search.`);
     bullet(`Every requested day off was honored — the engine treats “unavailable” as a hard rule, never a suggestion.`);
     if (res.preferTotal) bullet(`${res.preferGot} of ${res.preferTotal} preferred days granted; the misses lost out to load balancing or one-shift-per-day.`);
     if (res.capsHit.length) bullet(`Shift caps held: ${res.capsHit.map(n => n.replace(/,.*$/, '')).join(', ')} stopped at their requested maximums.`);
