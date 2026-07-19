@@ -2133,6 +2133,16 @@ function reviseActive(site, mo) {
   return !!(g.revise && g.site === site && g.month === mo);
 }
 
+/* "NOR", "nor", "Northport", "nmmc-tupelo" … → site code from the real data */
+function resolveSiteCode(x) {
+  if (!x) return null;
+  const q = String(x).trim().toLowerCase();
+  const codes = [...new Set(base.map(s => s.site).filter(Boolean))];
+  return codes.find(c => c.toLowerCase() === q)
+    || codes.find(c => siteName(c).toLowerCase().includes(q))
+    || null;
+}
+
 function loadPublishedProposal(site, mo) {
   const all = adminShifts();
   const here = all.filter(s => s.site === site && s.date.startsWith(mo));
@@ -2938,6 +2948,8 @@ const AGENT_TOOLS = [
     input_schema: { type: 'object', required: ['who'], properties: { who: { type: 'string' } } } },
   { name: 'refill_open_slots', description: 'Partial regeneration: the optimizer fills ONLY the proposal\'s currently OPEN slots while every existing assignment stays locked (rest/run/load rules hold across the combination). Use after clearing a provider or opening shifts.',
     input_schema: { type: 'object', properties: {} } },
+  { name: 'revise_schedule', description: 'Pull an existing site+month schedule (published months included) into the optimizer for reworking — same as the Builder\'s Revise Schedule button. The live schedule loads AS the proposal with every slot remembering its published holder; nothing moves until changes are made, and Apply stages only the differences vs published as drafts. Use when the scheduler says to unpublish, revise, rework, or pull up a month. Then: clear_provider_proposal/refill_open_slots for surgical changes, run_generation/proposal_ops to re-optimize the whole month. exit:true leaves revise mode and drops the loaded proposal.',
+    input_schema: { type: 'object', properties: { site: { type: 'string', description: 'Site code (e.g. NOR) or name fragment (e.g. Northport)' }, month: { type: 'string', description: 'YYYY-MM' }, exit: { type: 'boolean' } } } },
   { name: 'get_house_rules', description: 'Read the optimizer\'s built-in house rules: current value, default, and which are overridden. Covers rest hours, max consecutive days, cap/floor slack, PRN floor exemption, the time-of-day lock thresholds, and the soft-scoring weights (fill/preference/blocks/floor/over-target/time-of-day/tier).',
     input_schema: { type: 'object', properties: {} } },
   { name: 'set_house_rules', description: 'Change the house rules built into the optimizer, then rebuild the proposal. Pass only the fields to change. Numeric fields: restHours (min hours off between shifts, 0–24), maxRun (max consecutive days, 1–14; replaces any existing max-run chat rule), capSlack (cap = target+capSlack, 0–15), floorSlack (floor = target−floorSlack, 0–31), todHardMin (shifts of history before the time-of-day lock applies; raise to loosen, 0–9999), todHardFrac (lock threshold share, 0–1), and weights wFill/wPrefer/wBlock/wUnderFloor/wOverTarget/wTod/wTierFt/wTierPt/wTierPrn (0–5000; e.g. wBlock 0 stops rewarding back-to-back days). Boolean: prnExemptFloor. resetFields restores named fields to defaults; reset true restores everything. One-shift-per-day and requested days off are never tunable.',
@@ -3057,6 +3069,28 @@ async function agentToolExec(name, input) {
       await refillOpenSlots();
       return `Refill done: ${before - g.result.unfilled.length} of ${before} open slots filled by the optimizer (${g.result.engine === 'milp' ? g.result.solver.status : 'greedy'}); ${g.result.unfilled.length} remain open. Kept assignments untouched.`;
     }
+    if (name === 'revise_schedule') {
+      if (input.exit) {
+        if (!g.revise) return 'Revise mode is not on — nothing to exit.';
+        g.revise = false; g.result = null; g.applied = false;
+        return 'Exited revise mode: proposal dropped. Drafts already applied are untouched.';
+      }
+      const site = resolveSiteCode(input.site) || g.site;
+      const mo = /^\d{4}-\d{2}$/.test(input.month || '') ? input.month : g.month;
+      if (input.site && !resolveSiteCode(input.site)) return `No site matches "${input.site}". Codes: ${[...new Set(base.map(s => s.site).filter(Boolean))].sort().join(', ')}.`;
+      if (!adminShifts().some(s => s.site === site && s.date.startsWith(mo))) {
+        const months = [...new Set(adminShifts().filter(s => s.site === site).map(s => s.date.slice(0, 7)))].sort();
+        return `No shifts for ${siteName(site)} in ${mo}. Months with shifts there: ${months.join(', ') || 'none'}.`;
+      }
+      g.site = site; g.month = mo; g.revise = true;
+      g.applied = false; g.showEmails = false; g.expanded = new Set(); g.roleFilter = null;
+      g.claudeTargets = null; g.claudePlan = null; g.backtest = null;
+      g.result = loadPublishedProposal(site, mo);
+      audit(`Revise (copilot): loaded the working ${fmtMonth(mo)} schedule at ${siteName(site)} into the optimizer — ${g.result.assignments.length} assigned, ${g.result.unfilled.length} open`, 'ai');
+      const loads = [...g.result.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned);
+      return `Loaded ${siteName(site)} ${fmtMonth(mo)} into the optimizer (revise mode): ${g.result.assignments.length} of ${g.result.slots} slots assigned, ${g.result.unfilled.length} open, ${g.result.reqs.size} provider requests on file. The proposal currently equals the live schedule — Apply would stage 0 changes. Surgical: clear_provider_proposal + refill_open_slots. Whole-month: proposal_ops / set_house_rules / run_generation (expect a large diff).\nLoads: ` +
+        loads.slice(0, 25).map(s => `${s.who.replace(/,.*$/, '')} ${s.assigned}`).join(', ') + (loads.length > 25 ? ` +${loads.length - 25} more` : '');
+    }
     if (name === 'get_house_rules') {
       const cur = houseRules();
       return Object.keys(HOUSE_DEFAULTS).map(k =>
@@ -3149,7 +3183,9 @@ function agentSystemPrompt() {
     `You have full control through your tools. Read before you write: check the schedule/roster with get_schedule/get_providers rather than assuming. Shift edits stage as DRAFTS the staff can't see; tell the user drafts are pending and that they (or you, if they say so) must publish. Only call publish_drafts or discard_drafts when the user explicitly asks.`,
     houseRulesPromptLine(),
     `Schedule placement is done by the HiGHS mixed-integer optimizer (a real MILP solver running in the browser), NOT by you and not by a greedy heuristic — run_generation/proposal_ops invoke it, and its result is provably optimal or near-optimal under the house rules. Never hand-place a whole month shift-by-shift; adjust the inputs (requests, caps, targets, tiers, rules) and re-run the optimizer. Individual swaps/edits via update_shift are fine. The tool result tells you which engine placed the proposal; "greedy fallback" appears only if the solver failed to load.`,
-    g.revise ? `REVISE MODE is ON for ${siteName(g.site)} ${g.month}: the current proposal was loaded from the LIVE PUBLISHED schedule (each slot remembers its published holder). run_generation and proposal_ops re-optimize the ENTIRE month — published assignments become movable — while clear_provider_proposal + refill_open_slots are the surgical option that leaves everyone else in place. When the scheduler applies, only the DIFFERENCES vs the published schedule stage as drafts, so describe your changes as "N reassignments / M unassignments", not as filling a month from scratch.` : '',
+    g.revise
+      ? `REVISE MODE is ON for ${siteName(g.site)} ${g.month}: the current proposal was loaded from the LIVE PUBLISHED schedule (each slot remembers its published holder). run_generation and proposal_ops re-optimize the ENTIRE month — published assignments become movable — while clear_provider_proposal + refill_open_slots are the surgical option that leaves everyone else in place. When the scheduler applies, only the DIFFERENCES vs the published schedule stage as drafts, so describe your changes as "N reassignments / M unassignments", not as filling a month from scratch.`
+      : `To rework a month that's already published (the scheduler may say "unpublish September", "pull up June at Northport", "revise the live schedule"), call revise_schedule — it loads the live month into the optimizer and later stages only the differences as drafts.`,
     `Site codes: ${Object.entries(SITE_NAMES).map(([c, n]) => `${c}=${n}`).join(', ')}.`,
     `Be concise and concrete — cite names, dates, and counts from tool results. If a request is ambiguous, ask.`,
   ].filter(Boolean).join('\n\n');
@@ -3160,7 +3196,7 @@ async function runAgentChat(text) {
   agentConvo.push({ role: 'user', content: text });
   if (agentConvo.length > 40) agentConvo = agentConvo.slice(-30);
   let mutated = false;
-  const MUTATING = new Set(['update_shift', 'add_shift', 'remove_shift', 'set_tier', 'proposal_ops', 'run_generation', 'clear_provider_proposal', 'refill_open_slots', 'set_house_rules', 'discard_drafts', 'publish_drafts']);
+  const MUTATING = new Set(['update_shift', 'add_shift', 'remove_shift', 'set_tier', 'proposal_ops', 'run_generation', 'clear_provider_proposal', 'refill_open_slots', 'revise_schedule', 'set_house_rules', 'discard_drafts', 'publish_drafts']);
   for (let hop = 0; hop < 8; hop++) {
     const data = await backendCall('/api/agent', { system: agentSystemPrompt(), messages: agentConvo, tools: AGENT_TOOLS });
     agentConvo.push({ role: 'assistant', content: data.content });
