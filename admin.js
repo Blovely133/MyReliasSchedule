@@ -1906,7 +1906,19 @@ function renderScheduleChat(wrap) {
           pool: poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, target: p.target, tod: p.tod || null })) };
         const data = await backendCall('/api/chat', ctx);
         const n = applyBackendOps(data.ops);
-        overlay.genChat[overlay.genChat.length - 1].text = (data.reply || 'Done.') + (n && g.result ? ` (regenerated: ${(g.result = runGeneration(g.site, g.month)).assignments.length}/${g.result.slots})` : '');
+        let tail = '';
+        if (n) {
+          /* always rebuild the proposal so every change is visible immediately —
+             including the first chat message before Generate was ever clicked */
+          const hadStaleDrafts = g.applied;
+          g.result = runGeneration(g.site, g.month);
+          g.applied = false;
+          tail = ` (proposal updated: ${g.result.assignments.length}/${g.result.slots} filled)`;
+          if (hadStaleDrafts) tail += ' ⚠ You had already applied the old proposal as drafts — hit "Apply as drafts" again to update them.';
+        } else if ((data.ops || []).length) {
+          tail = ' ⚠ I got operations back but none matched a provider/rule here — try the exact name from the roster.';
+        }
+        overlay.genChat[overlay.genChat.length - 1].text = (data.reply || 'Done.') + tail;
       } catch (err) {
         overlay.genChat.pop();   // drop the "…" placeholder
         pushChat('ai', `Claude backend error (${String(err.message || err)}). Using the in-browser parser instead: ` + handleCommand(text).reply);
@@ -1930,7 +1942,7 @@ function renderScheduleChat(wrap) {
       x.title = 'Undo this change';
       x.onclick = () => {
         overlay.genAdjust = overlay.genAdjust.filter(z => z.id !== a.id);
-        if (g.result) { g.result = runGeneration(g.site, g.month); g.applied = false; }
+        g.result = runGeneration(g.site, g.month); g.applied = false;
         pushChat('ai', `Undid: ${a.summary}.`);
         saveOverlay();
         render();
@@ -2097,7 +2109,7 @@ function openRequestEditor(initialWho) {
         addAdjust('setRequest', { who: edit.who, mo, off, prefer, cap, note: edit.note.trim() },
           `${edit.who.replace(/,.*$/, '')} requests set (${off.length} off · ${prefer.length} prefer${cap ? ` · cap ${cap}` : ''})`, site);
         audit(`Requests editor: set ${edit.who} for ${fmtMonth(mo)} — ${off.length} off, ${prefer.length} prefer${cap ? `, cap ${cap}` : ''}`, 'ai');
-        if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+        g.result = runGeneration(site, mo); g.applied = false;
         saveOverlay();
         close();
         render();
@@ -2137,7 +2149,7 @@ function openRulesDialog() {
         overlay.genAdjust = overlay.genAdjust.filter(a => a.kind !== 'maxRun');
         addAdjust('maxRun', { value: n }, `max ${n} in a row (all sites)`, '*');
         audit(`Rules dialog: max ${n} consecutive days`, 'ai');
-        if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+        g.result = runGeneration(site, mo); g.applied = false;
         saveOverlay();
         paint();
       };
@@ -2171,7 +2183,7 @@ function openRulesDialog() {
         else if (kind === 'cap') { addAdjust('setCap', { who, value: n }, `${first} capped at ${n}`, site); audit(`Rules dialog: capped ${who} at ${n}`, 'ai'); }
         else if (kind === 'target') { addAdjust('setTarget', { who, value: n }, `${first} target ${n}/mo`, site); audit(`Rules dialog: ${who} target ${n}`, 'ai'); }
         else { addAdjust('setTimeOfDay', { who, tod: kind }, `${first} → ${kind}s only`, site); audit(`Rules dialog: ${who} ${kind} only`, 'ai'); }
-        if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+        g.result = runGeneration(site, mo); g.applied = false;
         saveOverlay();
         paint();
       };
@@ -2192,7 +2204,7 @@ function openRulesDialog() {
           x.type = 'button';
           x.onclick = () => {
             overlay.genAdjust = overlay.genAdjust.filter(z => z.id !== a.id);
-            if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+            g.result = runGeneration(site, mo); g.applied = false;
             saveOverlay();
             paint();
           };
