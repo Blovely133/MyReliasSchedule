@@ -403,7 +403,7 @@ function chipFor(s, opts = {}) {
   b.style.setProperty('--site', siteColor(s.site));
   addProviderRoleClass(b, role);
   const t = el('span', 't', `${s.start}–${s.end}`);
-  const who = el('span', 'who', isMine ? s.who.replace(/,.*$/, '') : (s.who || 'OPEN'));
+  const who = el('span', 'who', isMine ? 'You' : (s.who || 'OPEN'));
   b.append(t, who);
   /* agenda chips carry the position (grid views show it as the row header) */
   const metaParts = [];
@@ -523,7 +523,7 @@ function miniChipFor(s) {
   b.style.setProperty('--site', siteColor(s.site));
   addProviderRoleClass(b, role);
   b.append(el('span', 't', `${s.start}–${s.end}`));
-  const label = isMine ? s.who.replace(/,.*$/, '') : (s.who ? s.who.replace(/,.*$/, '') : 'OPEN');
+  const label = isMine ? 'You' : (s.who ? s.who.replace(/,.*$/, '') : 'OPEN');
   const meta = !isMine ? [s.site, role].filter(Boolean).join(' · ') : '';
   b.append(el('span', 'who', label + (meta ? ` · ${meta}` : '')));
   b.title = `${s.start}–${s.end} · ${s.pos} · ${s.who || 'OPEN'}${s.site ? ` · ${siteName(s.site)}` : ''}${s.note ? ` — ${s.note}` : ''}`;
@@ -1694,14 +1694,6 @@ function wireChrome() {
   };
   $('#prevWeek').onclick = () => { shiftPeriod(-1); };
   $('#nextWeek').onclick = () => { shiftPeriod(1); };
-  const todayBtn = $('#todayBtn');
-  if (todayBtn) {
-    todayBtn.onclick = () => {
-      state.month = TODAY.slice(0, 7);
-      state.selDay = TODAY;
-      render();
-    };
-  }
   $('#weekSelect').onchange = e => {
     state.month = e.target.value;
     render();
