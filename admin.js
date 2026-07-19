@@ -34,7 +34,7 @@ let state = {
   selDay: null,         // phone month grid: tapped day showing its detail card
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
-  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null, backtest: null },
+  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null, backtest: null, analyzeOpen: false, analyzeWho: null },
 };
 
 /* Site codes → full facility names, from WhenToWork's category list */
@@ -2308,45 +2308,90 @@ async function runBacktest(site, mo) {
 function renderAnalyzeCard(wrap) {
   const g = state.gen;
   const an = overlay.analyze;
+  const open = !!g.analyzeOpen;
   const box = el('div', 'reqform analyzebox');
-  cardHeader(box, '📊 Learned rules from history', an ? '↻ Re-analyze' : '🔍 Analyze history', () => {
+  cardHeader(box, `${open ? '▾' : '▸'} 📊 Learned rules from history`, an ? '↻ Re-analyze' : '🔍 Analyze history', () => {
     runAnalyze();
+    g.analyzeOpen = true;
     if (g.result) rebuildProposal(g.site, g.month);
     render();
   });
+  const h2 = box.querySelector('h2');
+  if (h2) {
+    h2.style.cursor = 'pointer';
+    h2.title = open ? 'Collapse' : 'Expand';
+    h2.onclick = () => { g.analyzeOpen = !open; render(); };
+  }
   if (!an) {
-    box.append(el('div', 'reqhint', 'Mines every human-made assignment in the imported W2W history — who works which weekdays, weekend rhythm, block style (7-on vs singles), position loyalty — into hard and soft rules with confidence scores. The optimizer then builds months that look like the ones your schedulers actually build. Nothing changes until you run it, and every rule stays toggleable.'));
+    if (open) box.append(el('div', 'reqhint', 'Mines every human-made assignment in the imported W2W history — who works which weekdays, weekend rhythm, block shapes and exact monthly loads, position loyalty — into hard and soft rules with confidence scores. The optimizer then builds months that look like the ones your schedulers actually build. Nothing changes until you run it, and every rule stays toggleable.'));
+    else box.append(el('div', 'reqhint', 'Not run yet — click Analyze history, or ▸ to read what it does.'));
     wrap.append(box);
     return;
   }
   const total = Object.values(an.rules).reduce((a, b) => a + b.length, 0);
   const counts = { hard: 0, soft: 0, off: 0 };
   for (const rs of Object.values(an.rules)) for (const r of rs) counts[r.mode] = (counts[r.mode] || 0) + 1;
+  if (!open) {
+    box.append(el('div', 'reqhint', `${total} rules across ${Object.keys(an.rules).length} providers (${counts.hard} hard · ${counts.soft} soft${counts.off ? ` · ${counts.off} off` : ''}), mined ${fmtDate(an.window[0])} – ${fmtDate(an.window[1])} — all active in generation. Click ▸ to browse, toggle, or backtest.`));
+    wrap.append(box);
+    return;
+  }
   box.append(el('div', 'reqhint', `Mined ${fmtDate(an.window[0])} – ${fmtDate(an.window[1])}: ${total} rules across ${Object.keys(an.rules).length} providers — ${counts.hard} hard · ${counts.soft} soft · ${counts.off} off. HARD = the optimizer may never break it; soft = it pays to follow it. Click a chip to cycle hard → soft → off.`));
-  const poolNames = poolFor(g.site, g.month).map(p => p.who);
-  const shown = poolNames.filter(w => an.rules[w]).sort();
+
+  const chipFor = (who, r) => {
+    const chip = el('button', 'adjchip rulechip mode-' + r.mode,
+      `${r.text.replace(/^[^:]+: /, '')} · ${Math.round(r.conf * 100)}%${r.mode === 'hard' ? ' · HARD' : r.mode === 'off' ? ' · OFF' : ''}`);
+    chip.type = 'button';
+    chip.title = `${r.text}\nconfidence ${Math.round(r.conf * 100)}% · support ${r.support} observations\nClick to cycle: hard → soft → off`;
+    chip.onclick = () => {
+      r.mode = r.mode === 'hard' ? 'soft' : r.mode === 'soft' ? 'off' : 'hard';
+      audit(`Mined rule set to ${r.mode.toUpperCase()}: ${r.text}`, 'ai');
+      saveOverlay();
+      if (g.result) rebuildProposal(g.site, g.month);
+      render();
+    };
+    return chip;
+  };
+
+  /* look up ANY mined provider, roster or not */
+  const poolNames = new Set(poolFor(g.site, g.month).map(p => p.who));
+  const allWho = Object.keys(an.rules).sort();
+  const lookRow = el('div', 'adjrow analyzerow lookuprow');
+  lookRow.append(el('span', 'todaylabel', '🔍 Look up'));
+  const sel = document.createElement('select');
+  const og1 = document.createElement('optgroup');
+  og1.label = `${siteName(g.site)} roster`;
+  const og2 = document.createElement('optgroup');
+  og2.label = 'Everyone else';
+  for (const w of allWho) {
+    const o = el('option', '', w);
+    o.value = w;
+    (poolNames.has(w) ? og1 : og2).append(o);
+  }
+  if (og1.children.length) sel.append(og1);
+  if (og2.children.length) sel.append(og2);
+  if (!g.analyzeWho || !an.rules[g.analyzeWho]) g.analyzeWho = allWho.find(w => poolNames.has(w)) || allWho[0];
+  sel.value = g.analyzeWho;
+  sel.onchange = () => { g.analyzeWho = sel.value; render(); };
+  lookRow.append(sel);
+  box.append(lookRow);
+  if (g.analyzeWho && an.rules[g.analyzeWho]) {
+    const lr = el('div', 'adjrow analyzerow');
+    for (const r of an.rules[g.analyzeWho]) lr.append(chipFor(g.analyzeWho, r));
+    box.append(lr);
+  }
+
+  const shown = [...poolNames].filter(w => an.rules[w]).sort();
   if (!shown.length) box.append(el('div', 'reqhint', `No mined rules for the current ${siteName(g.site)} roster (providers need 8+ worked days in the window).`));
+  else box.append(el('div', 'reqhint rosterlabel', `${siteName(g.site)} roster:`));
   for (const who of shown) {
     const row = el('div', 'adjrow analyzerow');
     row.append(el('span', 'todaylabel', who.replace(/,.*$/, '')));
-    for (const r of an.rules[who]) {
-      const chip = el('button', 'adjchip rulechip mode-' + r.mode,
-        `${r.text.replace(/^[^:]+: /, '')} · ${Math.round(r.conf * 100)}%${r.mode === 'hard' ? ' · HARD' : r.mode === 'off' ? ' · OFF' : ''}`);
-      chip.type = 'button';
-      chip.title = `${r.text}\nconfidence ${Math.round(r.conf * 100)}% · support ${r.support} observations\nClick to cycle: hard → soft → off`;
-      chip.onclick = () => {
-        r.mode = r.mode === 'hard' ? 'soft' : r.mode === 'soft' ? 'off' : 'hard';
-        audit(`Mined rule set to ${r.mode.toUpperCase()}: ${r.text}`, 'ai');
-        saveOverlay();
-        if (g.result) rebuildProposal(g.site, g.month);
-        render();
-      };
-      row.append(chip);
-    }
+    for (const r of an.rules[who]) row.append(chipFor(who, r));
     box.append(row);
   }
   const others = Object.keys(an.rules).length - shown.length;
-  if (others > 0) box.append(el('div', 'reqhint', `…plus ${others} more providers beyond the ${siteName(g.site)} roster — their rules travel with them wherever they're scheduled.`));
+  if (others > 0) box.append(el('div', 'reqhint', `…plus ${others} more providers beyond the ${siteName(g.site)} roster (use Look up above) — their rules travel with them wherever they're scheduled.`));
   if (backendOn()) {
     const nb = el('button', '', an.narrating ? '✦ Opus is reviewing…' : '✦ Opus, sanity-check these rules');
     nb.type = 'button';

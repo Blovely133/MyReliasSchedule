@@ -422,6 +422,16 @@ table.flat th.sorted { color: var(--rh-yellow); }
   padding: 6px 8px;
 }
 .analyzebox .kpirow { margin-top: 10px; }
+.analyzebox h2 { user-select: none; }
+.lookuprow select {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  max-width: 100%;
+}
+.rosterlabel { margin-top: 14px; font-weight: 600; }
 
 /* ---- proposal repair: clear provider + refill opens ---- */
 .refillrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 4px 0 12px; }
