@@ -3476,8 +3476,8 @@ function unleashMech() {
   const mechH = Math.min(H * 0.42, 360);
   const u = mechH / 200;
   const GUN_A = -0.62;
-  const mech = { x: Math.max(120, W * 0.28), phase: 0, lastStep: 1, muzzle: -9, nextFire: 2.6 };
-  const walkSpeed = (W - mech.x + 220 * u) / 6.8;
+  const mech = { x: Math.max(120, W * 0.28), phase: 0, lastStep: 1, muzzle: -9, nextFire: 1.7 };
+  const walkSpeed = (W - mech.x + 220 * u) / 3.4;
   const DARK = '#252b34', MID = '#39424f', LIGHT = '#4a5462', CYAN = '#00bedd', YELLOW = '#f7c948';
 
   function panel(x, y, w, h, fill) {
@@ -3572,7 +3572,7 @@ function unleashMech() {
 
   /* timeline */
   const startMs = performance.now();
-  let lastMs = startMs, nextBoom = 0.05, endAt = 10.2, curT = 0, raf = 0, failsafe = 0;
+  let lastMs = startMs, nextBoom = 0.05, endAt = 5.2, curT = 0, raf = 0, failsafe = 0;
 
   function teardown() {
     clearTimeout(failsafe);
@@ -3586,7 +3586,7 @@ function unleashMech() {
     mechShowRunning = false;
   }
   /* rAF pauses in hidden tabs — make sure the show always strikes its own set */
-  failsafe = setTimeout(teardown, 14000);
+  failsafe = setTimeout(teardown, 8000);
   function onKey(e) { if (e.key === 'Escape') endAt = Math.min(endAt, curT + 0.3); }
   window.addEventListener('keydown', onKey);
   cv.addEventListener('click', () => { endAt = Math.min(endAt, curT + 0.3); });
@@ -3596,13 +3596,13 @@ function unleashMech() {
     const dt = Math.min(0.033, (nowMs - lastMs) / 1000); lastMs = nowMs;
     ctx.clearRect(0, 0, W, H);
 
-    if (t >= nextBoom && t < endAt - 0.9) {
+    if (t >= nextBoom && t < endAt - 0.7) {
       explode(50 + Math.random() * (W - 100), 50 + Math.random() * H * 0.72, 0.7 + Math.random() * 1.1, false);
-      nextBoom = t + (t < 6.5 ? 0.2 + Math.random() * 0.28 : 0.45 + Math.random() * 0.5);
+      nextBoom = t + (t < 3.2 ? 0.18 + Math.random() * 0.22 : 0.38 + Math.random() * 0.4);
     }
 
     const gy = H - 8;
-    const rise = Math.max(0, Math.min(1, (t - 1.1) / 1.3));
+    const rise = Math.max(0, Math.min(1, (t - 0.6) / 0.9));
     const eased = 1 - (1 - rise) ** 3;
     const gyDraw = gy + (1 - eased) * mechH * 1.2;
     if (rise > 0 && rise < 1 && Math.random() < 0.3) {

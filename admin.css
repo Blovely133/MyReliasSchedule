@@ -194,14 +194,9 @@ table.cov th.sitecol .sitesub { display: block; font-size: 10.5px; color: var(--
   font-weight: 700;
   letter-spacing: .3px;
   cursor: pointer;
-  animation: dontclick-pulse 2.2s ease-in-out infinite;
 }
 .top-actions .dontclick:hover { background: #ff5a5f; color: #fff; border-color: #ff8a8d; }
-.top-actions .dontclick:disabled { opacity: .8; cursor: default; animation: none; }
-@keyframes dontclick-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgb(229 72 77 / .55); }
-  50% { box-shadow: 0 0 0 8px rgb(229 72 77 / 0); }
-}
+.top-actions .dontclick:disabled { opacity: .8; cursor: default; }
 .mech-overlay { position: fixed; inset: 0; z-index: 9999; }
 body.mech-shake { animation: mech-shake .28s linear infinite; }
 @keyframes mech-shake {
@@ -213,7 +208,6 @@ body.mech-shake { animation: mech-shake .28s linear infinite; }
   100% { transform: translate(0, 0); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .top-actions .dontclick { animation: none; }
   body.mech-shake { animation: none; }
 }
 .suggestbtn {
