@@ -26,7 +26,7 @@ let state = {
   site: '',
   pos: '',
   search: '',
-  covFocus: null,       // {site, date} — coverage detail panel
+  focusDay: null,       // set by a coverage-cell click; highlighted in the Builder grid
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
 };
@@ -441,7 +441,7 @@ function renderApprovals(main) {
   kpis.append(kpi(swaps, 'Swaps & pickups to approve', swaps ? 'warn' : 'ok'));
   kpis.append(kpi(subs, 'Time-off submissions to review', subs ? 'warn' : 'ok'));
   kpis.append(kpi(msgs, 'Messages awaiting reply', msgs ? 'warn' : 'ok'));
-  kpis.append(kpi(opensMonth, 'Open shifts left this month', opensMonth ? 'warn' : 'ok', () => { state.covFocus = null; state.month = TODAY.slice(0, 7); setView('coverage'); }));
+  kpis.append(kpi(opensMonth, 'Open shifts left this month', opensMonth ? 'warn' : 'ok', () => { state.month = TODAY.slice(0, 7); setView('coverage'); }));
   wrap.append(kpis);
 
   const q = state.search.toLowerCase();
@@ -689,7 +689,7 @@ function renderCoverage(main) {
   const kpis = el('div', 'kpirow');
   kpis.append(kpi(openTotal, 'Unfilled this month (upcoming)', openTotal ? 'warn' : 'ok'));
   kpis.append(kpi(gapSites, 'Sites with gaps', gapSites ? 'warn' : 'ok'));
-  kpis.append(kpi(draftPending, 'Draft changes awaiting publish', draftPending ? 'draftk' : ''));
+  kpis.append(kpi(draftPending, 'Draft changes awaiting publish', draftPending ? 'draftk' : '', draftPending ? () => setView('builder') : null));
   main.append(kpis);
 
   const legend = el('div', 'covlegend');
@@ -703,7 +703,7 @@ function renderCoverage(main) {
   legend.append(sw('var(--open-bg)', 'needs coverage (number = unfilled)'));
   legend.append(sw('color-mix(in srgb, #00d084 25%, var(--panel))', 'fully covered'));
   legend.append(sw('var(--rh-yellow)', 'has unpublished draft changes'));
-  legend.append(el('span', '', 'Click any cell to see the day and fill gaps.'));
+  legend.append(el('span', '', "Click any cell to open that site's full month in the Builder."));
   main.append(legend);
 
   const covName = site => site === '—' ? '(no site listed)' : siteName(site);
@@ -736,13 +736,17 @@ function renderCoverage(main) {
       const open = cell.filter(s => !s.who).length;
       const hasDraft = cell.some(s => s.draft);
       const b = el('button', 'covcell' + (open ? ' gap' : cell.length ? ' ok' : '') + (hasDraft ? ' hasdraft' : ''));
-      if (state.covFocus && state.covFocus.site === site && state.covFocus.date === d) b.classList.add('focus');
       if (cell.length) {
         b.append(el('span', 'gapnum', open ? `${open} open` : '✓'));
         b.append(el('span', 'totnum', `${cell.length} shift${cell.length === 1 ? '' : 's'}`));
       } else b.append(el('span', 'totnum', '—'));
-      b.title = `${covName(site)} · ${fmtDateLong(d)} — ${cell.length} shifts, ${open} unfilled`;
-      b.onclick = () => { state.covFocus = { site, date: d }; render(); };
+      b.title = `${covName(site)} · ${fmtDateLong(d)} — ${cell.length} shifts, ${open} unfilled · opens the month schedule`;
+      b.onclick = () => {
+        state.site = site === '—' ? '' : site;
+        state.focusDay = d;
+        setView('builder');
+        document.querySelector('.bigcal td.focusday')?.scrollIntoView({ block: 'center' });
+      };
       td.append(b);
       tr.append(td);
     }
@@ -752,53 +756,6 @@ function renderCoverage(main) {
   wrap.append(table);
   main.append(wrap);
 
-  /* --- day detail / gap-filling panel --- */
-  if (state.covFocus && days.includes(state.covFocus.date)) {
-    const { site, date } = state.covFocus;
-    const cell = ((bySiteDay.get(site) || new Map()).get(date) || []).slice()
-      .sort((a, b) => a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
-    const panel = el('div', 'reqform covdetail');
-    const h = el('h2');
-    h.append(document.createTextNode(`${site === '—' ? '(no site listed)' : siteName(site)} — ${fmtDateLong(date)}`));
-    const addBtn = el('button', '', '＋ Add shift here');
-    addBtn.onclick = () => openDialog(null, { date, site: site === '—' ? '' : site, pos: state.pos || '' });
-    const closeBtn = el('button', 'closebtn', 'Close');
-    closeBtn.onclick = () => { state.covFocus = null; render(); };
-    h.append(addBtn, closeBtn);
-    panel.append(h);
-    if (!cell.length) panel.append(el('div', 'approval-empty', 'No shifts here this day yet.'));
-    for (const s of cell) {
-      const row = el('div', 'covshift' + (s.who ? '' : ' open') + (s.draft ? ' draft' : ''));
-      row.style.setProperty('--site', siteColor(s.site));
-      row.append(el('span', 't', `${s.start}–${s.end}`));
-      row.append(el('span', 'p', s.pos));
-      row.append(s.who ? el('span', '', s.who) : el('span', 'openlbl', 'OPEN'));
-      if (s.draft) row.append(el('span', 'draftflag', 'draft'));
-      const edit = el('button', '', 'Edit');
-      edit.onclick = () => openDialog(s);
-      row.append(edit);
-      if (!s.who) {
-        const sugg = el('span', 'suggestrow');
-        const cands = suggestFor(s, 5);
-        sugg.append(el('span', '', cands.length ? 'Fill with:' : 'No free site-regulars that day — open the editor to assign anyone.'));
-        for (const c of cands) {
-          const btn = el('button', 'suggestbtn' + (c.likes ? ' likes' : ''));
-          btn.append(document.createTextNode(c.name.replace(/,.*$/, '') + ' '));
-          btn.append(el('span', 'cnt', `(${c.count} this mo${c.likes ? ' · prefers' : ''})`));
-          btn.title = `${c.name} — works this site, free ${fmtDate(s.date)}, ${c.count} shifts this month${c.likes ? ', marked "prefer to work"' : ''}`;
-          btn.onclick = () => {
-            draftEdit(s, { who: c.name });
-            audit(`Draft: assigned ${c.name} to ${describeShift(s)}`, 'edit');
-            render();
-          };
-          sugg.append(btn);
-        }
-        row.append(sugg);
-      }
-      panel.append(row);
-    }
-    main.append(panel);
-  }
 }
 
 /* ---------- builder ---------- */
@@ -900,7 +857,7 @@ function renderBuilder(main) {
   for (let i = 0; i < first.getUTCDay(); i++) tr.append(el('td', 'off'));
   for (let day = 1; day <= daysIn; day++) {
     const iso = `${mo}-${String(day).padStart(2, '0')}`;
-    const td = el('td', iso === TODAY ? 'today' : '');
+    const td = el('td', (iso === TODAY ? 'today ' : '') + (iso === state.focusDay ? 'focusday' : ''));
     const cell = (byDay.get(iso) || []).sort((a, b) => a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
     const dn = el('div', 'dn');
     dn.append(el('span', '', String(day)));
@@ -1242,7 +1199,7 @@ function publishDraft() {
 function renderPublishBar() {
   const bar = $('#publishBar');
   const n = draftCount();
-  const show = n > 0 && (state.view === 'builder' || state.view === 'coverage');
+  const show = n > 0 && state.view === 'builder';
   bar.hidden = !show;
   if (!show) return;
   const d = overlay.adminDraft;
@@ -1360,7 +1317,6 @@ function shiftPeriod(n) {
 
 function setView(v) {
   state.view = v;
-  if (v !== 'coverage') state.covFocus = null;
   document.querySelectorAll('#viewTabs button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
   const periodControls = v === 'coverage' || v === 'builder' || v === 'reports';
   $('#filterBar').querySelector('.weeknav').style.visibility = periodControls ? 'visible' : 'hidden';

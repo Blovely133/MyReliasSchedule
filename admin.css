@@ -174,34 +174,10 @@ table.cov th.sitecol .sitesub { display: block; font-size: 10.5px; color: var(--
 .covcell.gap { background: var(--open-bg); color: var(--open-line); font-weight: 700; box-shadow: inset 0 0 0 1px var(--open-line); }
 .covcell.gap:hover { box-shadow: inset 0 0 0 2px var(--open-line); }
 .covcell.hasdraft { box-shadow: inset 0 0 0 1px var(--rh-yellow); }
-.covcell.focus { outline: 2px solid var(--rh-yellow); outline-offset: -2px; }
 .covcell .gapnum { display: block; font-size: 13px; }
 .covcell .totnum { display: block; font-size: 10px; opacity: .8; }
 .covlegend { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 10px 2px; color: var(--ink-soft); font-size: 12px; }
 .covlegend .swatch { display: inline-block; width: 13px; height: 13px; border-radius: 4px; margin-right: 5px; vertical-align: -2px; }
-
-.covdetail { margin-top: 14px; }
-.covdetail h2 { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.covdetail h2 .closebtn { margin-left: auto; }
-.covshift {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  flex-wrap: wrap;
-  border: 1px solid var(--line);
-  border-left: 4px solid var(--site, #888);
-  border-radius: 8px;
-  background: var(--bg);
-  padding: 8px 10px;
-  margin: 6px 0;
-  font-size: 13px;
-}
-.covshift.open { border-left-color: var(--open-line); background: var(--open-bg); }
-.covshift.draft { outline: 2px dashed var(--rh-yellow); outline-offset: -2px; }
-.covshift .t { font-weight: 700; font-variant-numeric: tabular-nums; }
-.covshift .p { color: var(--ink-soft); }
-.covshift .openlbl { color: var(--open-line); font-weight: 700; }
-.suggestrow { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--ink-soft); }
 
 /* ---- assignment suggestions ---- */
 .suggestbox { margin-top: 12px; }
@@ -222,6 +198,7 @@ table.cov th.sitecol .sitesub { display: block; font-size: 10.5px; color: var(--
 .drafthint b { text-transform: uppercase; letter-spacing: .4px; }
 
 /* ---- builder ---- */
+.bigcal td.focusday { outline: 2px dashed var(--rh-yellow); outline-offset: -2px; }
 .chip.draftchip { outline: 2px dashed var(--rh-yellow); outline-offset: -2px; }
 .draftflag {
   display: inline-block;
