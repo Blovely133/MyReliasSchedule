@@ -38,6 +38,52 @@ function myNotifs() {
   return overlay.notifs.filter(n => n.to === state.viewAs).slice().reverse();
 }
 
+/* ---------- lightweight feedback: toasts + styled confirm ---------- */
+
+function toast(text) {
+  let host = $('#toastHost');
+  if (!host) { host = document.createElement('div'); host.id = 'toastHost'; document.body.append(host); }
+  const t = el('div', 'toast', text);
+  host.append(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 350); }, 3400);
+}
+
+/* styled stand-in for confirm(): resolves true/false; Escape and backdrop-click cancel.
+   Settles explicitly on every path rather than trusting the dialog 'close' event alone. */
+function confirmSheet({ title, lines = [], confirmLabel = 'Confirm', danger = false }) {
+  return new Promise(resolve => {
+    const dlg = document.createElement('dialog');
+    dlg.className = 'confirm-sheet';
+    let settled = false;
+    const settle = v => {
+      if (settled) return;
+      settled = true;
+      if (dlg.open) dlg.close();
+      dlg.remove();
+      resolve(v);
+    };
+    const body = el('div', 'confirm-body');
+    body.append(el('h2', '', title));
+    for (const t of lines) body.append(el('div', 'confirm-line', t));
+    const row = el('div', 'dialog-actions');
+    const cancel = el('button', '', 'Cancel');
+    const ok = el('button', danger ? 'danger' : 'primary', confirmLabel);
+    cancel.type = 'button';
+    ok.type = 'button';
+    cancel.onclick = () => settle(false);
+    ok.onclick = () => settle(true);
+    row.append(cancel, el('span', 'spacer'), ok);
+    body.append(row);
+    dlg.append(body);
+    dlg.addEventListener('click', e => { if (e.target === dlg) settle(false); });
+    dlg.addEventListener('close', () => settle(false));   // Escape key
+    document.body.append(dlg);
+    dlg.showModal();
+    ok.focus();
+  });
+}
+
 /* Site codes → full facility names, from WhenToWork's category list */
 const SITE_NAMES = {
   'Psych': 'Arise Psychiatry',
@@ -412,22 +458,9 @@ function renderFilterBar() {
   }
 }
 
-function renderDatalists() {
-  const people = [...new Set(shifts().map(s => s.who).filter(Boolean))].sort();
-  $('#peopleList').innerHTML = people.map(p => `<option value="${p.replace(/"/g, '&quot;')}">`).join('');
-  const poss = [...new Set(base.map(s => s.pos))].sort();
-  $('#posList').innerHTML = poss.map(p => `<option value="${p.replace(/"/g, '&quot;')}">`).join('');
-  const sites = [...new Set(base.map(s => s.site).filter(Boolean))].sort();
-  $('#siteList').innerHTML = sites.map(p => `<option value="${p}">`).join('');
-}
-
 /* ---------- schedule chips ---------- */
 
 function openShiftFromSchedule(s) {
-  if (!state.viewAs) {
-    openDialog(s);
-    return;
-  }
   openPersonDialog(s.who || '', s);
 }
 
@@ -475,7 +508,7 @@ function prefMarkerFor(iso) {
 
 /* opts: cellMarks(iso, cell) → small nodes inside each day cell;
    detailChip(shift) → full chip for the tapped day's card;
-   collapse, addable, prefFor as in the grid views */
+   collapse, prefFor as in the grid views */
 function phoneMonthCal(main, mo, byDay, opts) {
   const collapse = opts.collapse || DETAIL_COLLAPSED;
   if (state.selDay && !state.selDay.startsWith(mo)) state.selDay = null;
@@ -534,11 +567,6 @@ function phoneMonthCal(main, mo, byDay, opts) {
     card.append(more);
   }
   if (!cell.length && pref !== 'no') card.append(el('div', 'anone', 'No shifts'));
-  if (!state.viewAs && opts.addable) {
-    const add = el('button', 'addbtn agenda-add', '+ add shift');
-    add.onclick = () => openDialog(null, { date: sel, pos: state.pos || '', site: state.site || '' });
-    card.append(add);
-  }
   main.append(card);
 }
 
@@ -592,7 +620,6 @@ function renderMonthAll(main) {
       detailChip: s => chipFor(s, { showPos: true }),
       collapse: mineOnly ? Infinity : DETAIL_COLLAPSED,
       prefFor: prefMarkerFor,
-      addable: true,
       cellMarks: (iso, cell) => {
         const out = [];
         if (mineOnly) {
@@ -651,12 +678,6 @@ function renderMonthAll(main) {
       };
       td.append(more);
     }
-    if (!state.viewAs) {
-      const add = el('button', 'addbtn', '+ add');
-      add.onclick = () => openDialog(null, { date: iso, pos: state.pos || '', site: state.site || '' });
-      td.append(add);
-    }
-
     tr.append(td);
     if ((first.getUTCDay() + day) % 7 === 0) { table.append(tr); tr = el('tr'); }
   }
@@ -946,39 +967,49 @@ function renderTrades(main) {
       tr.append(tdS);
       const tdA = el('td');
       if (mine && t.status === 'open' && t.who !== mine && s) {
-        const claim = el('button', 'primary', 'Claim');
-        claim.onclick = () => {
-          t.claimedBy = mine;
-          t.status = 'claimed';
-          pushNotif(t.who, `${mine} claimed your ${fmtDate(s.date)} shift — awaiting approval`, 'requests', 'trades');
-          pushNotif('', `${mine} claimed ${t.who}'s ${fmtDate(s.date)} shift — needs approval`, 'requests', 'trades');
-          saveOverlay(); render();
-        };
-        tdA.append(claim);
+        const need = providerRole(s);
+        const me = providerRole({ pos: '', who: mine });
+        if (need && me && need !== me) {
+          const na = el('span', 'req-badge req-pending', need === 'PHY' ? 'physicians only' : 'APCs only');
+          na.title = `This shift needs ${need === 'PHY' ? 'a physician' : 'an APC'}`;
+          tdA.append(na);
+        } else {
+          const claim = el('button', 'primary', 'Claim');
+          claim.onclick = async () => {
+            const ok = await confirmSheet({
+              title: `Claim ${t.who.replace(/,.*$/, '')}'s shift?`,
+              lines: [tradeShiftLabel(s), 'The scheduler still has to approve the swap.'],
+              confirmLabel: 'Claim shift',
+            });
+            if (!ok) return;
+            t.claimedBy = mine;
+            t.status = 'claimed';
+            pushNotif(t.who, `${mine} claimed your ${fmtDate(s.date)} shift — awaiting approval`, 'requests', 'trades');
+            pushNotif('', `${mine} claimed ${t.who}'s ${fmtDate(s.date)} shift — needs approval`, 'requests', 'trades');
+            saveOverlay(); render();
+            toast('Claim sent — awaiting scheduler approval');
+          };
+          tdA.append(claim);
+        }
       }
       if (mine && t.who === mine && ['open', 'proposed', 'claimed'].includes(t.status)) {
         const cancel = el('button', 'danger', 'Withdraw');
-        cancel.onclick = () => { t.status = 'cancelled'; saveOverlay(); render(); };
+        cancel.onclick = async () => {
+          const ok = await confirmSheet({
+            title: 'Withdraw this offer?',
+            lines: [tradeShiftLabel(s)],
+            confirmLabel: 'Withdraw offer',
+            danger: true,
+          });
+          if (!ok) return;
+          t.status = 'cancelled';
+          const counterpart = t.targetWho || t.claimedBy;
+          if (counterpart) pushNotif(counterpart, `${mine} withdrew their swap offer`, 'requests', 'trades');
+          if (s) pushNotif('', `${mine} withdrew their ${fmtDate(s.date)} ${s.start}–${s.end} swap offer`, 'requests', 'trades');
+          saveOverlay(); render();
+          toast('Offer withdrawn');
+        };
         tdA.append(cancel);
-      }
-      if (!mine && t.status === 'claimed' && s) {
-        const ok = el('button', '', 'Approve');
-        ok.onclick = () => {
-          applyEdit(s, { who: t.targetWho || t.claimedBy });
-          if (requested && t.targetWho) applyEdit(requested, { who: t.who });
-          t.status = 'approved';
-          pushNotif(t.who, `Trade approved: your ${fmtDate(s.date)} swap is complete`, 'requests', 'swap');
-          pushNotif(t.targetWho || t.claimedBy, `Trade approved: you now work ${fmtDate(s.date)} ${s.start}–${s.end} at ${s.site}`, 'requests', 'swap');
-          saveOverlay(); render();
-        };
-        const no = el('button', 'danger', 'Deny');
-        no.onclick = () => {
-          pushNotif(t.targetWho || t.claimedBy, `Trade denied for ${t.who}'s ${fmtDate(s.date)} shift`, 'requests', 'swap');
-          t.status = t.targetWho ? 'denied' : 'open';
-          t.claimedBy = null;
-          saveOverlay(); render();
-        };
-        tdA.append(ok, no);
       }
       tr.append(tdA);
       tb.append(tr);
@@ -1078,6 +1109,7 @@ function renderPrefs(main) {
       pushNotif('', `${mine} submitted ${fmtMonth(mo)} requests: ${parts.join(', ')}`, 'requests', 'prefs');
       saveOverlay();
       render();
+      toast(`${fmtMonth(mo)} requests sent to the scheduler`);
     };
     bar.append(btn);
     main.append(bar);
@@ -1129,7 +1161,13 @@ function renderRequestsHub(main) {
   if (state.reqSub === 'swap') {
     if (state.viewAs) renderSwap(body);
     else {
-      // manager mode: approvals table + open-shift list
+      // Everyone mode is read-only: browse the board, act in the scheduler console
+      const hint = el('div', 'reqhint consolehint');
+      hint.append(document.createTextNode('Viewing as Everyone is read-only — approvals and schedule changes live in the '));
+      const a = el('a', 'linklike', 'Scheduler console →');
+      a.href = 'admin.html';
+      hint.append(a);
+      body.append(hint);
       renderTrades(body);
       renderOpen(body);
       const pending = overlay.trades.filter(t => t.status === 'claimed').length;
@@ -1147,63 +1185,102 @@ function swapChip(s, trade, mine) {
   const isMine = s.who === mine;
   const isOpen = !s.who;
   const role = providerRole(s);
+  const myRole = providerRole({ pos: '', who: mine });
+  /* hard rail: physicians' shifts stay with physicians, APC shifts with APCs */
+  const roleBlocked = Boolean(role && myRole && role !== myRole);
+  const future = s.date >= TODAY;
   const b = el('button', 'chip mini2');
   b.style.setProperty('--site', siteColor(s.site));
   addProviderRoleClass(b, role);
   b.append(el('span', 't', `${s.start}–${s.end}`));
-  const label = isMine ? s.who.replace(/,.*$/, '') : (s.who ? s.who.replace(/,.*$/, '') : 'OPEN — click to pick up');
+  const pickable = isOpen && future && !roleBlocked;
+  const label = isMine ? s.who.replace(/,.*$/, '') : (s.who ? s.who.replace(/,.*$/, '') : (pickable ? 'OPEN — click to pick up' : 'OPEN'));
   const meta = !isMine ? [s.site, role].filter(Boolean).join(' · ') : '';
   b.append(el('span', 'who', label + (meta ? ` · ${meta}` : '')));
   if (isPhone()) b.append(el('span', 'site', s.pos));
-  const future = s.date >= TODAY;
 
   if (isOpen) {
     b.classList.add('open');
-    if (future) {
+    if (!future) b.classList.add('inert');
+    else if (roleBlocked) {
+      b.classList.add('inert');
+      b.title = role === 'PHY' ? 'Physician shift — outside your discipline' : 'APC shift — outside your discipline';
+    } else {
       b.classList.add('pickupable');
       b.title = `Open shift: ${s.pos} · click to pick it up`;
-      b.onclick = () => {
-        if (!confirm(`Pick up this open shift?\n\n${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos} at ${siteName(s.site)}`)) return;
+      b.onclick = async () => {
+        const ok = await confirmSheet({
+          title: 'Pick up this open shift?',
+          lines: [`${fmtDateLong(s.date)} · ${s.start}–${s.end}`, `${s.pos} at ${siteName(s.site)}`, 'It goes straight onto your schedule, and the scheduler is notified.'],
+          confirmLabel: 'Pick up shift',
+        });
+        if (!ok) return;
         applyEdit(s, { who: mine });
         pushNotif('', `${mine} picked up the open ${fmtDate(s.date)} ${s.start}–${s.end} ${s.pos} shift`, 'requests', 'swap');
         saveOverlay();
         render();
+        toast('Shift added to your schedule');
       };
-    } else b.classList.add('inert');
+    }
   } else if (isMine) {
     b.classList.add('minechip', 'my-shift');
     if (trade) {
       b.append(el('span', 'swapbadge', trade.status === 'claimed' ? `swap pending: ${trade.claimedBy.replace(/,.*$/, '')}` : 'offered for swap'));
       b.title = 'Click to withdraw this swap offer';
-      b.onclick = () => {
-        if (!confirm('Withdraw your swap offer for this shift?')) return;
+      b.onclick = async () => {
+        const ok = await confirmSheet({
+          title: 'Withdraw this swap offer?',
+          lines: [`${fmtDateLong(s.date)} · ${s.start}–${s.end} · ${s.pos}`],
+          confirmLabel: 'Withdraw offer',
+          danger: true,
+        });
+        if (!ok) return;
         trade.status = 'cancelled';
         if (trade.claimedBy) pushNotif(trade.claimedBy, `${mine} withdrew the ${fmtDate(s.date)} swap offer`, 'requests', 'swap');
+        pushNotif('', `${mine} withdrew their ${fmtDate(s.date)} ${s.start}–${s.end} swap offer`, 'requests', 'swap');
         saveOverlay();
         render();
+        toast('Offer withdrawn');
       };
     } else if (future) {
       b.title = 'Your shift — click to offer it for swap';
-      b.onclick = () => {
-        if (!confirm(`Offer this shift for swap?\n\n${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos} at ${siteName(s.site)}\n\nCoworkers at your sites can claim it; the scheduler approves the change.`)) return;
+      b.onclick = async () => {
+        const ok = await confirmSheet({
+          title: 'Offer this shift for swap?',
+          lines: [`${fmtDateLong(s.date)} · ${s.start}–${s.end}`, `${s.pos} at ${siteName(s.site)}`, 'Coworkers at your sites can claim it; the scheduler approves the final change.'],
+          confirmLabel: 'Offer for swap',
+        });
+        if (!ok) return;
         overlay.trades.push({ id: 't' + Date.now(), shiftId: s.id, who: mine, note: '', claimedBy: null, status: 'open', created: TODAY });
         pushNotif('', `${mine} offered their ${fmtDate(s.date)} ${s.start}–${s.end} ${s.pos} shift for swap`, 'requests', 'swap');
         saveOverlay();
         render();
+        toast('Offer posted — coworkers at your sites can claim it');
       };
     } else b.classList.add('inert');
+  } else if (trade && trade.status === 'open' && future && roleBlocked) {
+    b.classList.add('coworker-shift');
+    b.append(el('span', 'swapbadge', role === 'PHY' ? 'physician swap' : 'APC swap'));
+    b.title = `${s.who} offered this shift — it needs ${role === 'PHY' ? 'a physician' : 'an APC'}`;
+    b.onclick = () => openPersonDialog(s.who, s);
   } else if (trade && trade.status === 'open' && future) {
     b.classList.add('swappable');
     b.append(el('span', 'swapbadge', 'offered — click to claim'));
     b.title = `${s.who} offered this shift · click to claim it`;
-    b.onclick = () => {
-      if (!confirm(`Claim ${s.who}'s shift?\n\n${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos} at ${siteName(s.site)}\n\nThe scheduler still has to approve the swap.`)) return;
+    b.onclick = async () => {
+      const ok = await confirmSheet({
+        title: `Claim ${s.who.replace(/,.*$/, '')}'s shift?`,
+        lines: [`${fmtDateLong(s.date)} · ${s.start}–${s.end}`, `${s.pos} at ${siteName(s.site)}`, 'The scheduler still has to approve the swap.'],
+        confirmLabel: 'Claim shift',
+      });
+      if (!ok) return;
       trade.claimedBy = mine;
       trade.status = 'claimed';
       pushNotif(trade.who, `${mine} claimed your ${fmtDate(s.date)} shift — awaiting approval`, 'requests', 'swap');
       pushNotif('', `${mine} claimed ${trade.who}'s ${fmtDate(s.date)} shift — needs approval`, 'requests', 'swap');
       saveOverlay();
       render();
+      toast('Claim sent — awaiting scheduler approval');
     };
   } else {
     b.classList.add('coworker-shift');
@@ -1250,6 +1327,7 @@ function renderDirectSwapOffers(main, mine) {
         pushNotif('', `${mine} accepted ${t.who}'s direct swap — needs approval`, 'requests', 'swap');
         saveOverlay();
         render();
+        toast('Accepted — awaiting scheduler approval');
       };
       const decline = el('button', 'danger', 'Decline');
       decline.onclick = () => {
@@ -1257,6 +1335,7 @@ function renderDirectSwapOffers(main, mine) {
         pushNotif(t.who, `${mine} declined your swap offer`, 'requests', 'swap');
         saveOverlay();
         render();
+        toast('Offer declined');
       };
       tdActions.append(accept, decline);
     }
@@ -1265,8 +1344,10 @@ function renderDirectSwapOffers(main, mine) {
       withdraw.onclick = () => {
         t.status = 'cancelled';
         pushNotif(t.targetWho, `${mine} withdrew their swap offer`, 'requests', 'swap');
+        pushNotif('', `${mine} withdrew their direct swap offer to ${t.targetWho}`, 'requests', 'swap');
         saveOverlay();
         render();
+        toast('Offer withdrawn');
       };
       tdActions.append(withdraw);
     }
@@ -1409,7 +1490,7 @@ function renderOpen(main) {
     return;
   }
   const table = el('table', 'flat');
-  table.innerHTML = '<thead><tr><th>Date</th><th>Time</th><th>Position</th><th>Site</th><th>Note</th><th></th></tr></thead>';
+  table.innerHTML = '<thead><tr><th>Date</th><th>Time</th><th>Position</th><th>Site</th><th>Note</th></tr></thead>';
   const tb = el('tbody');
   for (const s of list) {
     const tr = el('tr');
@@ -1422,14 +1503,6 @@ function renderOpen(main) {
     tdSite.append(tag);
     tr.append(tdSite);
     tr.append(el('td', '', s.note || ''));
-    const tdAct = el('td');
-    const claim = el('button', '', 'Claim');
-    claim.onclick = () => {
-      const who = prompt('Assign this shift to:', state.person);
-      if (who) { applyEdit(s, { who }); render(); }
-    };
-    tdAct.append(claim);
-    tr.append(tdAct);
     tb.append(tr);
   }
   table.append(tb);
@@ -1547,11 +1620,14 @@ function openPersonDialog(person, shift = null) {
   const hint = $('#personDialogHint');
 
   if (!mine || !person || person === mine) {
-    $('#personDialogTitle').textContent = person === mine ? 'Your shift' : 'Shift details';
+    const isMyShift = Boolean(mine && person && person === mine);
+    $('#personDialogTitle').textContent = isMyShift ? 'Your shift' : 'Shift details';
     actions.hidden = true;
-    hint.textContent = person === mine
+    hint.textContent = isMyShift
       ? 'Employee schedules are read-only here. Use Requests if you need to offer this shift or contact the scheduler.'
-      : 'Employee schedules are read-only here. Open shifts can be requested from Requests.';
+      : mine
+        ? 'Employee schedules are read-only here. Open shifts can be requested from Requests.'
+        : 'Schedules are read-only here — schedule changes happen in the Scheduler console.';
     $('#personDialog').showModal();
     return;
   }
@@ -1587,6 +1663,8 @@ function openPersonDialog(person, shift = null) {
 
 function wirePersonDialog() {
   const dlg = $('#personDialog');
+  /* Escape closes natively (showModal); clicking the backdrop should too */
+  dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });
   $('#personCloseBtn').onclick = () => dlg.close();
   $('#personSwapBtn').onclick = () => showPersonPanel('swap');
   $('#personContactBtn').onclick = () => showPersonPanel('contact');
@@ -1615,6 +1693,7 @@ function wirePersonDialog() {
     dlg.close();
     state.reqSub = 'swap';
     setView('requests');
+    toast(`Swap offer sent to ${personTarget.replace(/,.*$/, '')}`);
   };
 
   $('#directContactForm').onsubmit = e => {
@@ -1627,28 +1706,14 @@ function wirePersonDialog() {
     saveOverlay();
     dlg.close();
     setView('contact');
+    toast(`Message sent to ${personTarget.replace(/,.*$/, '')}`);
   };
 }
 
-/* ---------- shift dialog ---------- */
+/* ---------- overlay edits (schedule editing itself lives in the scheduler console) ---------- */
 
-let dialogShift = null;
-
-function openDialog(s, defaults) {
-  if (state.viewAs) {
-    openPersonDialog(s?.who || '', s || null);
-    return;
-  }
-  dialogShift = s;
-  const f = $('#shiftForm');
-  $('#dialogTitle').textContent = s ? 'Edit Shift' : 'Add Shift';
-  $('#deleteShiftBtn').style.display = s ? '' : 'none';
-  const v = s || { date: TODAY, start: '07:00', end: '19:00', who: '', site: '', note: '', pos: '', ...defaults };
-  f.date.value = v.date; f.pos.value = v.pos; f.start.value = v.start; f.end.value = v.end;
-  f.who.value = v.who; f.site.value = v.site; f.note.value = v.note;
-  $('#shiftDialog').showModal();
-}
-
+/* applies a field change to a shift in the local overlay — used by approved
+   flows like open-shift pickups, never by a general editor on this surface */
 function applyEdit(s, fields) {
   if (String(s.id).startsWith('a')) {
     const a = overlay.added.find(x => x.id === s.id);
@@ -1657,32 +1722,6 @@ function applyEdit(s, fields) {
     overlay.edits[s.id] = { ...(overlay.edits[s.id] || {}), ...fields };
   }
   saveOverlay();
-}
-
-function wireDialog() {
-  const dlg = $('#shiftDialog');
-  $('#cancelBtn').onclick = () => dlg.close();
-  $('#deleteShiftBtn').onclick = () => {
-    if (dialogShift && confirm('Delete this shift?')) {
-      overlay.removed.push(dialogShift.id);
-      saveOverlay();
-      dlg.close();
-      render();
-    }
-  };
-  $('#shiftForm').onsubmit = e => {
-    const f = e.target;
-    const fields = {
-      date: f.date.value, pos: f.pos.value.trim(), start: f.start.value, end: f.end.value,
-      who: f.who.value.trim(), site: f.site.value.trim(), note: f.note.value.trim(),
-    };
-    if (dialogShift) applyEdit(dialogShift, fields);
-    else {
-      overlay.added.push({ id: 'a' + Date.now(), ...fields });
-      saveOverlay();
-    }
-    render();
-  };
 }
 
 /* ---------- export / import ---------- */
@@ -1766,12 +1805,18 @@ function wireChrome() {
       render();
     } catch (err) { alert('Could not read that file: ' + err.message); }
   };
-  $('#resetBtn').onclick = () => {
-    if (confirm('Discard all local changes and return to the imported schedule?')) {
-      overlay = DEFAULT_OVERLAY();
-      saveOverlay();
-      render();
-    }
+  $('#resetBtn').onclick = async () => {
+    const ok = await confirmSheet({
+      title: 'Discard all local changes?',
+      lines: ['Requests, swaps, messages, and edits made in this browser are removed and the imported schedule comes back.'],
+      confirmLabel: 'Discard changes',
+      danger: true,
+    });
+    if (!ok) return;
+    overlay = DEFAULT_OVERLAY();
+    saveOverlay();
+    render();
+    toast('Local changes discarded');
   };
 }
 
@@ -1841,7 +1886,6 @@ function toggleBell() {
 
 function render() {
   renderFilterBar();
-  renderDatalists();
   const main = $('#main');
   main.innerHTML = '';
   if (state.view === 'month') renderMonthAll(main);
@@ -1854,7 +1898,6 @@ function render() {
 (async function init() {
   await unlockData();
   wireChrome();
-  wireDialog();
   wirePersonDialog();
   render();
   /* live cross-tab sync: scheduler-console actions appear here without a refresh */

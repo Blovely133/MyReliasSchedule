@@ -84,9 +84,9 @@
 
 <div class="filterbar" id="filterBar">
   <div class="weeknav">
-    <button id="prevWeek" title="Previous week">‹</button>
+    <button id="prevWeek" title="Previous month">‹</button>
     <select id="weekSelect"></select>
-    <button id="nextWeek" title="Next week">›</button>
+    <button id="nextWeek" title="Next month">›</button>
   </div>
   <select id="siteFilter"><option value="">All sites</option></select>
   <select id="posFilter"><option value="">All positions</option></select>
@@ -100,26 +100,7 @@
 
 <main id="main"></main>
 
-<dialog id="shiftDialog">
-  <form method="dialog" id="shiftForm">
-    <h2 id="dialogTitle">Edit Shift</h2>
-    <div class="grid2">
-      <label>Date <input type="date" name="date" required></label>
-      <label>Position <input name="pos" list="posList" required></label>
-      <label>Start <input type="time" name="start" required></label>
-      <label>End <input type="time" name="end" required></label>
-      <label>Assigned to <input name="who" list="peopleList" placeholder="leave blank = OPEN"></label>
-      <label>Site <input name="site" list="siteList"></label>
-      <label class="wide">Note <input name="note" placeholder="optional note"></label>
-    </div>
-    <div class="dialog-actions">
-      <button type="button" id="deleteShiftBtn" class="danger">Delete</button>
-      <span class="spacer"></span>
-      <button type="button" id="cancelBtn">Cancel</button>
-      <button type="submit" class="primary" id="saveBtn">Save</button>
-    </div>
-  </form>
-</dialog>
+<!-- schedule editing lives in the scheduler console (admin.html); this surface is read-only + requests -->
 
 <dialog id="personDialog" class="person-dialog" aria-labelledby="personDialogTitle">
   <div class="person-dialog-body">
@@ -167,10 +148,6 @@
     </div>
   </div>
 </dialog>
-
-<datalist id="peopleList"></datalist>
-<datalist id="posList"></datalist>
-<datalist id="siteList"></datalist>
 
 <footer class="foot">
   <span>MyReliasSchedule prototype — changes save in this browser only. </span>

@@ -387,17 +387,29 @@ function conflictsFor(name, shift) {
   if (!name) return [];
   const out = [];
   const all = publishedShifts();
+  const roleVotes = { PHY: 0, APC: 0 };
   for (const s of all) {
-    if (s.who !== name || s.id === shift.id) continue;
+    if (s.who !== name) continue;
+    const r = slotRole(s.pos);
+    if (r === 'PHY' || r === 'APC') roleVotes[r]++;
+    if (s.id === shift.id) continue;
     if (s.date === shift.date) out.push(`Also works ${s.start}–${s.end} ${s.pos} @ ${s.site || '—'} that day`);
     if (s.date === addDays(shift.date, -1) && isOvernight(s) && shift.start < '12:00') out.push(`Coming off an overnight ending ${s.end} that morning`);
+  }
+  const need = slotRole(shift.pos);
+  const can = providerRole({ pos: '', who: name }) ||
+    (roleVotes.PHY > roleVotes.APC ? 'PHY' : roleVotes.APC > roleVotes.PHY ? 'APC' : '');
+  if ((need === 'PHY' || need === 'APC') && can && need !== can) {
+    out.push(need === 'PHY'
+      ? `Physician position — ${name.replace(/,.*$/, '')} is an APC`
+      : `APC position — ${name.replace(/,.*$/, '')} is a physician`);
   }
   if ((overlay.prefs[name] || {})[shift.date] === 'no') out.push('Marked UNAVAILABLE that day');
   return out;
 }
 
-/* candidates to fill a shift: work this site, free that day, fewest shifts
-   that month first, "prefer to work" marks float to the top */
+/* candidates to fill a shift: right discipline (PHY vs APC), work this site,
+   free that day, fewest shifts that month first, "prefer to work" floats up */
 function suggestFor(shift, topN = 8) {
   if (!shift.site || !shift.date) return [];
   const monthKey = shift.date.slice(0, 7);
@@ -405,15 +417,33 @@ function suggestFor(shift, topN = 8) {
   const worksSite = new Set();
   const busy = new Set();
   const monthCount = {};
+  const roleVotes = {};
   for (const s of all) {
     if (!s.who) continue;
     if (s.site === shift.site) worksSite.add(s.who);
     if (s.date === shift.date && s.id !== shift.id) busy.add(s.who);
     if (s.date.startsWith(monthKey)) monthCount[s.who] = (monthCount[s.who] || 0) + 1;
+    const r = slotRole(s.pos);
+    if (r === 'PHY' || r === 'APC') (roleVotes[s.who] || (roleVotes[s.who] = { PHY: 0, APC: 0 }))[r]++;
   }
+  /* discipline is a hard rail: never suggest an APC for a physician slot or vice versa.
+     Credentials in the name decide; otherwise the positions they've actually worked. */
+  const need = slotRole(shift.pos);
+  const disciplineOf = n => {
+    const cred = providerRole({ pos: '', who: n });
+    if (cred) return cred;
+    const v = roleVotes[n];
+    if (!v) return '';
+    return v.PHY > v.APC ? 'PHY' : v.APC > v.PHY ? 'APC' : '';
+  };
   const pref = name => (overlay.prefs[name] || {})[shift.date] || null;
   return [...worksSite]
     .filter(n => !busy.has(n) && pref(n) !== 'no')
+    .filter(n => {
+      if (need !== 'PHY' && need !== 'APC') return true;
+      const d = disciplineOf(n);
+      return !d || d === need;
+    })
     .sort((a, b) =>
       (pref(b) === 'like' ? 1 : 0) - (pref(a) === 'like' ? 1 : 0) ||
       (monthCount[a] || 0) - (monthCount[b] || 0) ||
@@ -3312,6 +3342,7 @@ function openModal(cls, build) {
   const cleanup = () => { if (dlg.parentNode) dlg.remove(); };
   dlg.addEventListener('close', cleanup);   // Escape key closes → clean up too
   const close = () => { dlg.close(); cleanup(); };
+  dlg.addEventListener('click', e => { if (e.target === dlg) close(); });   // backdrop click closes
   build(body, close);
   dlg.showModal();
   return { dlg, body, close };
@@ -4289,11 +4320,13 @@ function updateSuggestions() {
   const f = $('#shiftForm');
   const box = $('#suggestBox');
   box.innerHTML = '';
-  const pseudo = { id: dialogShift?.id || '·new·', date: f.date.value, site: f.site.value.trim(), start: f.start.value, end: f.end.value };
+  const pseudo = { id: dialogShift?.id || '·new·', date: f.date.value, pos: f.pos.value.trim(), site: f.site.value.trim(), start: f.start.value, end: f.end.value };
   if (!pseudo.date || !pseudo.site) return;
   const cands = suggestFor(pseudo, 8);
   if (!cands.length) return;
-  box.append(el('div', 'sughead', `Good fits for ${pseudo.site} on ${fmtDate(pseudo.date)} — free that day, fewest shifts first`));
+  const need = slotRole(pseudo.pos);
+  const who = need === 'PHY' ? 'physicians ' : need === 'APC' ? 'APCs ' : '';
+  box.append(el('div', 'sughead', `Good fits for ${pseudo.site} on ${fmtDate(pseudo.date)} — ${who}free that day, fewest shifts first`));
   for (const c of cands) {
     const btn = el('button', 'suggestbtn' + (c.likes ? ' likes' : ''));
     btn.type = 'button';
@@ -4320,8 +4353,9 @@ function openDialog(s, defaults) {
 function wireDialog() {
   const dlg = $('#shiftDialog');
   const f = $('#shiftForm');
+  dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });   // backdrop click closes
   $('#cancelBtn').onclick = () => dlg.close();
-  for (const name of ['date', 'site', 'start', 'end']) f[name].onchange = updateSuggestions;
+  for (const name of ['date', 'pos', 'site', 'start', 'end']) f[name].onchange = updateSuggestions;
   $('#deleteShiftBtn').onclick = () => {
     if (dialogShift && confirm('Remove this shift (as a draft change)?')) {
       draftRemove(dialogShift);
