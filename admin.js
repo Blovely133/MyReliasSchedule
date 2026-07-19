@@ -31,7 +31,7 @@ let state = {
   focusDay: null,       // set by a coverage-cell click; highlighted in the Builder grid
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
-  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null },
+  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null },
 };
 
 /* Site codes → full facility names, from WhenToWork's category list */
@@ -1112,6 +1112,27 @@ function renderAudit(main) {
   main.append(box);
 }
 
+/* ---------- Claude backend (optional) ----------
+   When a backend URL is configured, the chat box and Generate button route
+   through the Cloudflare Worker → Opus 4.8. Everything falls back to the
+   in-browser logic if it's not connected or a call fails. */
+
+const BACKEND_KEY = 'mrs-claude-backend';
+function backendCfg() { try { return JSON.parse(localStorage.getItem(BACKEND_KEY) || 'null'); } catch { return null; } }
+function backendSet(cfg) { if (cfg && cfg.url) localStorage.setItem(BACKEND_KEY, JSON.stringify(cfg)); else localStorage.removeItem(BACKEND_KEY); }
+function backendOn() { return Boolean(backendCfg()?.url); }
+
+async function backendCall(path, payload) {
+  const cfg = backendCfg();
+  if (!cfg?.url) throw new Error('No Claude backend connected.');
+  const headers = { 'content-type': 'application/json' };
+  if (cfg.token) headers['x-console-token'] = cfg.token;
+  const res = await fetch(cfg.url.replace(/\/+$/, '') + path, { method: 'POST', headers, body: JSON.stringify(payload) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || data.error || ('HTTP ' + res.status));
+  return data;
+}
+
 /* ---------- AI schedule generation ----------
    The reconciliation engine runs live in the browser (deterministic greedy
    with hard rules + scoring). Example request lists are seeded for NMMC-Tupelo
@@ -1335,18 +1356,59 @@ function poolFor(site, mo) {
   const avg = siteAvgDays(site);
   const ex = EXAMPLE_SCHEDULING[site];
   if (ex && ex.month === mo) {
-    return applyPoolAdjust(ex.pool.map(([who, role, seeded, float]) => {
+    return withClaudeTargets(applyPoolAdjust(ex.pool.map(([who, role, seeded, float]) => {
       const h = avg.get(who);
       /* floats keep their small caps; regulars target their own recent average
          when it's a credible signal (2+ months, 4+ days/mo) — otherwise the
          planned roster number stands in for missing/stray W2W history */
       const useAvg = !float && !!h && h.months >= 2 && h.avg >= 4;
       return { who, role, target: useAvg ? Math.round(h.avg) : seeded, avg: h ? h.avg : 0, fromAvg: useAvg, float: !!float };
-    }), site);
+    }), site), site, mo);
   }
-  return applyPoolAdjust([...avg.entries()]
+  return withClaudeTargets(applyPoolAdjust([...avg.entries()]
     .filter(([, h]) => h.avg >= 1)
-    .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false })), site);
+    .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false })), site), site, mo);
+}
+
+/* when Opus 4.8 produced per-provider targets for this exact site+month, use them */
+function withClaudeTargets(pool, site, mo) {
+  const ct = state.gen.claudeTargets;
+  if (!ct || state.gen.claudeKey !== `${site}|${mo}`) return pool;
+  return pool.map(p => ct.has(p.who) ? { ...p, target: ct.get(p.who), fromAvg: false, fromClaude: true } : p);
+}
+
+/* apply structured ops returned by /api/chat (same effect as handleCommand) */
+function applyBackendOps(ops) {
+  const g = state.gen;
+  let n = 0;
+  for (const op of ops || []) {
+    const who = op.who || '';
+    const first = who.replace(/,.*$/, '');
+    const iso = (op.dates || []).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d));
+    if (op.kind === 'addProvider' && who) {
+      addAdjust('addProvider', { who, role: op.role || 'PHY', target: op.target || 12, tod: op.tod || null }, `${first} added (${op.role || 'PHY'}, ${op.target || 12}/mo${op.tod ? ', ' + op.tod + 's' : ''})`); n++;
+    } else if (op.kind === 'removeProvider' && who) {
+      addAdjust('removeProvider', { who }, `${first} removed`); n++;
+    } else if (op.kind === 'addOff' && who && iso.length) {
+      addAdjust('addOff', { who, dates: iso }, `${first} off ${moShort(g.month)} ${fmtDayRanges(g.month, new Set(iso))}`); n++;
+    } else if (op.kind === 'addPrefer' && who && iso.length) {
+      addAdjust('addPrefer', { who, dates: iso }, `${first} prefers ${moShort(g.month)} ${fmtDayRanges(g.month, new Set(iso))}`); n++;
+    } else if (op.kind === 'setCap' && who && op.value) {
+      addAdjust('setCap', { who, value: op.value }, `${first} capped at ${op.value}`); n++;
+    } else if (op.kind === 'setTarget' && who && op.value) {
+      addAdjust('setTarget', { who, value: op.value }, `${first} target ${op.value}/mo`); n++;
+    } else if (op.kind === 'setTimeOfDay' && who && op.tod) {
+      addAdjust('setTimeOfDay', { who, tod: op.tod }, `${first} → ${op.tod}s only`); n++;
+    } else if (op.kind === 'maxRun' && op.value) {
+      overlay.genAdjust = overlay.genAdjust.filter(a => a.kind !== 'maxRun');
+      addAdjust('maxRun', { value: op.value }, `max ${op.value} in a row (all sites)`, '*'); n++;
+    } else if (op.kind === 'move' && who && op.toWho && op.date && g.result) {
+      const a = g.result.assignments.find(x => x.who === who && x.slot.date === op.date);
+      if (a) { const slot = a.slot; removeFromSlot(g.result, slot); addToSlot(g.result, slot, op.toWho); recomputeProposalDerived(g.result); n++; }
+    }
+  }
+  if (n) audit(`Opus 4.8 applied ${n} operation${n === 1 ? '' : 's'} from the chat box`, 'ai');
+  return n;
 }
 
 function runGeneration(site, mo) {
@@ -1439,8 +1501,10 @@ function applyGeneration(gen) {
 }
 
 function stageGenerate() {
+  if (backendOn()) return stageGenerateClaude();
   const g = state.gen;
   g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
+  g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null;
   render();
   const pool = poolFor(g.site, g.month);
   const reqs = requestsFor(g.site, g.month);
@@ -1698,8 +1762,11 @@ function handleCommand(raw) {
 function renderScheduleChat(wrap) {
   const g = state.gen;
   const box = el('div', 'reqform genchat');
-  box.append(el('h2', '', '💬 Talk to the schedule'));
-  box.append(el('div', 'reqhint', 'Free-type roster and rule changes — new providers, removals, days off, caps, "nights only", or moves after generating. This prototype parses commands in-browser; production routes the same box through Claude\'s API.'));
+  const on = backendOn();
+  cardHeader(box, '💬 Talk to the schedule', on ? '🔌 Claude connected' : '🔌 Connect Claude', openBackendDialog);
+  box.append(el('div', 'reqhint', on
+    ? 'Connected to Opus 4.8 — type roster and rule changes in plain English, any phrasing. Falls back to the in-browser parser if the backend is unreachable.'
+    : 'Free-type roster and rule changes — new providers, removals, days off, caps, "nights only", or moves after generating. Parsed in-browser now; connect the Claude backend to run this on Opus 4.8.'));
   const log = el('div', 'chatlog');
   const msgs = overlay.genChat || [];
   if (!msgs.length) {
@@ -1714,12 +1781,30 @@ function renderScheduleChat(wrap) {
   const send = el('button', 'primary', 'Send');
   send.type = 'submit';
   form.append(inp, send);
-  form.onsubmit = e => {
+  form.onsubmit = async e => {
     e.preventDefault();
     const text = inp.value.trim();
     if (!text) return;
     pushChat('you', text);
-    pushChat('ai', handleCommand(text).reply);
+    if (backendOn()) {
+      pushChat('ai', '…');
+      g.chatFocus = true;
+      saveOverlay();
+      render();
+      try {
+        const ctx = { text, site: g.site, siteName: siteName(g.site), month: g.month,
+          people: [...new Set(base.map(s => s.who).filter(Boolean))],
+          pool: poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, target: p.target, tod: p.tod || null })) };
+        const data = await backendCall('/api/chat', ctx);
+        const n = applyBackendOps(data.ops);
+        overlay.genChat[overlay.genChat.length - 1].text = (data.reply || 'Done.') + (n && g.result ? ` (regenerated: ${(g.result = runGeneration(g.site, g.month)).assignments.length}/${g.result.slots})` : '');
+      } catch (err) {
+        overlay.genChat.pop();   // drop the "…" placeholder
+        pushChat('ai', `Claude backend error (${String(err.message || err)}). Using the in-browser parser instead: ` + handleCommand(text).reply);
+      }
+    } else {
+      pushChat('ai', handleCommand(text).reply);
+    }
     g.chatFocus = true;
     saveOverlay();
     render();
@@ -2112,6 +2197,92 @@ function openSlotPicker(res, slot) {
   });
 }
 
+/* connect the Claude backend */
+function openBackendDialog() {
+  openModal('backend-modal', (body, close) => {
+    const cfg = backendCfg() || {};
+    const status = el('div', 'reqhint', '');
+    function paint() {
+      body.innerHTML = '';
+      body.append(el('h2', '', '🔌 Connect Claude (Opus 4.8)'));
+      body.append(el('div', 'reqhint', 'Point the console at your Cloudflare Worker so the chat box and Generate button run on Opus 4.8. Without a backend, everything still works using the in-browser logic.'));
+      const urlF = el('label', 'modal-field', 'Backend URL ');
+      const urlI = document.createElement('input');
+      urlI.type = 'url'; urlI.placeholder = 'https://shiftboard-claude.<subdomain>.workers.dev';
+      urlI.value = cfg.url || '';
+      urlF.append(urlI);
+      const tokF = el('label', 'modal-field', 'Console token (optional) ');
+      const tokI = document.createElement('input');
+      tokI.type = 'password'; tokI.placeholder = 'only if you set CONSOLE_TOKEN';
+      tokI.value = cfg.token || '';
+      tokF.append(tokI);
+      body.append(urlF, tokF, status);
+      const actions = el('div', 'dialog-actions');
+      const test = el('button', '', 'Test connection');
+      test.type = 'button';
+      test.onclick = async () => {
+        const url = urlI.value.trim().replace(/\/+$/, '');
+        if (!url) { status.textContent = 'Enter the Worker URL first.'; return; }
+        status.textContent = 'Testing…';
+        try {
+          const res = await fetch(url + '/api/health');
+          const h = await res.json();
+          status.textContent = h.ok
+            ? `✓ Connected. Model ${h.model}. ${h.hasKey ? 'API key set.' : '⚠ No API key on the Worker yet — run: wrangler secret put ANTHROPIC_API_KEY'}${h.tokenRequired ? ' Token required.' : ''}`
+            : 'Reached the Worker but it reported not-ok.';
+        } catch (e) { status.textContent = '✗ Could not reach that URL. Check it and that the Worker is deployed.'; }
+      };
+      const disc = el('button', 'danger', 'Disconnect');
+      disc.type = 'button';
+      disc.onclick = () => { backendSet(null); close(); render(); };
+      const save = el('button', 'primary', 'Save');
+      save.type = 'button';
+      save.onclick = () => { backendSet({ url: urlI.value.trim(), token: tokI.value.trim() }); close(); render(); };
+      actions.append(disc, el('span', 'spacer'), test, save);
+      body.append(actions);
+    }
+    paint();
+  });
+}
+
+/* Opus-4.8-driven generation: Claude sets targets + writes the rationale, the
+   deterministic engine places the shifts (all hard rules still guaranteed) */
+async function stageGenerateClaude() {
+  const g = state.gen;
+  g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
+  g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null;
+  render();
+  const steps = ['Sending provider history and requests to Opus 4.8…', 'Opus 4.8 is reading the requests and setting targets…', 'Placing shifts with the rule engine…'];
+  let i = 0;
+  const tick = () => { const e = document.getElementById('genStatus'); if (e && i < steps.length) { e.textContent = steps[i++]; setTimeout(tick, 900); } };
+  tick();
+  try {
+    const profiles = timeProfiles();
+    const providers = poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, avg: p.avg || 0, usual: usualShift(profiles.get(p.who)) }));
+    const reqs = [...requestsFor(g.site, g.month).values()]
+      .filter(r => providers.some(p => p.who === r.who) || r.source === 'example')
+      .map(r => ({ who: r.who, off: [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), prefer: [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), cap: r.cap, note: r.note }));
+    const openSlots = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
+    const maxRun = (genAdjustFor(g.site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+    const data = await backendCall('/api/generate', {
+      site: g.site, siteName: siteName(g.site), month: g.month, historyMonths: HIST_MONTHS.length,
+      openSlots, providers, requests: reqs, rules: `no more than ${maxRun} consecutive days; at least 10h between shifts; keep night providers on nights`,
+    });
+    g.claudeTargets = new Map((data.targets || []).filter(t => t.who && t.target).map(t => [t.who, t.target]));
+    g.claudeKey = `${g.site}|${g.month}`;
+    g.claudePlan = { analysis: data.analysis, notes: data.notes || [], targetCount: (data.targets || []).length };
+    g.result = runGeneration(g.site, g.month);
+    audit(`Opus 4.8 generated the ${fmtMonth(g.month)} plan for ${siteName(g.site)} — ${g.claudePlan.targetCount} provider targets`, 'ai');
+  } catch (err) {
+    g.claudePlan = { error: String(err.message || err) };
+    g.result = runGeneration(g.site, g.month);   // graceful fallback to the local engine
+    audit(`Claude backend call failed (${String(err.message || err)}); used the built-in engine instead`, 'ai');
+  }
+  g.running = false;
+  saveOverlay();
+  render();
+}
+
 /* ---------- generate view ---------- */
 
 /* month-calendar preview of a generated proposal (assigned chips removable, OPEN chips fillable) */
@@ -2239,7 +2410,7 @@ function renderGenerate(main) {
     if (s === g.site) o.selected = true;
     siteSel.append(o);
   }
-  siteSel.onchange = () => { g.site = siteSel.value; g.result = null; g.applied = false; g.showEmails = false; render(); };
+  siteSel.onchange = () => { g.site = siteSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
   const moSel = document.createElement('select');
   for (const m of months) {
     const o = el('option', '', fmtMonth(m));
@@ -2247,10 +2418,10 @@ function renderGenerate(main) {
     if (m === g.month) o.selected = true;
     moSel.append(o);
   }
-  moSel.onchange = () => { g.month = moSel.value; g.result = null; g.applied = false; g.showEmails = false; render(); };
+  moSel.onchange = () => { g.month = moSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
   const lb = (t, i) => { const l = el('label', '', t + ' '); l.append(i); return l; };
   row.append(lb('Site (★ = example requests seeded)', siteSel), lb('Month', moSel));
-  const goBtn = el('button', 'primary genbtn', g.running ? 'Generating…' : '✨ Generate schedule');
+  const goBtn = el('button', 'primary genbtn', g.running ? 'Generating…' : (backendOn() ? '✨ Generate with Opus 4.8' : '✨ Generate schedule'));
   goBtn.disabled = g.running;
   goBtn.onclick = stageGenerate;
   row.append(goBtn);
@@ -2300,6 +2471,25 @@ function renderGenerate(main) {
     reqBox.append(table);
   }
   wrap.append(reqBox);
+
+  /* Opus 4.8's plan (when generated through the backend) */
+  if (g.claudePlan) {
+    const cp = el('div', 'reqform claudeplan');
+    cardHeader(cp, '✦ Opus 4.8’s analysis', backendOn() ? '🔌 Claude connected' : null, backendOn() ? openBackendDialog : null);
+    if (g.claudePlan.error) {
+      cp.append(el('div', 'conflict', `⚠ Backend call failed: ${g.claudePlan.error}`));
+      cp.append(el('div', 'reqhint', 'Fell back to the built-in engine below — the proposal is still valid. Check the Worker URL/key via 🔌 Connect Claude.'));
+    } else {
+      cp.append(el('div', 'claudeanalysis', g.claudePlan.analysis || ''));
+      if (g.claudePlan.notes?.length) {
+        const ul = el('ul', 'ainotes');
+        for (const n of g.claudePlan.notes) ul.append(el('li', '', n));
+        cp.append(ul);
+      }
+      cp.append(el('div', 'reqhint', `Opus 4.8 set ${g.claudePlan.targetCount} provider targets from the history and requests; the rule engine below placed the shifts so every hard rule holds.`));
+    }
+    wrap.append(cp);
+  }
 
   /* results */
   const res = g.result;
@@ -2358,7 +2548,9 @@ function renderGenerate(main) {
       tr.append(el('td', '', s.role));
       tr.append(el('td', '', s.tod ? ({ night: 'nights', day: 'days', eve: 'evenings' }[s.tod] + ' (rule)') : usualShift(s.prof)));
       tr.append(el('td', '', String(s.assigned)));
-      if (s.fromAvg) {
+      if (s.fromClaude) {
+        tr.append(el('td', '', `${s.target} (Opus)`));
+      } else if (s.fromAvg) {
         tr.append(el('td', '', `${s.target} (avg ${s.avg.toFixed(1)})`));
       } else {
         anyPlanned = true;

@@ -1,0 +1,10 @@
+{
+  "name": "shiftboard-claude",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Claude (Opus 4.8) backend for the MyReliasSchedule scheduler console",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}

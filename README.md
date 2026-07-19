@@ -37,6 +37,13 @@ Two surfaces (both on the shared demo PIN for now; the split-PIN option is one
   submissions land in the console live (open them side-by-side in two windows
   for the full demo).
 
+**Optional Claude backend** (`worker/`): a Cloudflare Worker that makes the
+scheduler console's chat box and Generate button run on Opus 4.8. The Anthropic
+key lives on the Worker as a secret; the static site never holds it. Deploy with
+`cd worker && npm run deploy && npx wrangler secret put ANTHROPIC_API_KEY`, then
+connect the console via **✨ Generate → 🔌 Connect Claude**. Everything falls
+back to the in-browser logic when it's not connected. See `worker/README.md`.
+
 To (re)encrypt after changing data or PINs:
 
     $env:MY_RELIAS_PIN='<employee pin>'; node scripts/encrypt-data.mjs

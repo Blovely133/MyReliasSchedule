@@ -1,0 +1,9 @@
+{
+  // Scheduler-console backend: proxies the admin page's "talk to the schedule"
+  // and "generate" calls to Claude (Opus 4.8). The Anthropic key lives here as
+  // a Worker secret and is never exposed to the browser.
+  "name": "shiftboard-claude",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-01",
+  "observability": { "enabled": true }
+}
