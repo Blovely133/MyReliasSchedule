@@ -81,10 +81,11 @@ const CHAT_TOOL = {
           properties: {
             kind: {
               type: 'string',
-              enum: ['addProvider', 'removeProvider', 'addOff', 'addPrefer', 'setCap', 'setTarget', 'setTimeOfDay', 'maxRun', 'move'],
+              enum: ['addProvider', 'removeProvider', 'addOff', 'addPrefer', 'setCap', 'setTarget', 'setTimeOfDay', 'setTier', 'maxRun', 'move'],
             },
             who: { type: 'string', description: 'Full provider name as it appears in the roster, e.g. "Blake Lovely, MD".' },
             role: { type: 'string', enum: ['PHY', 'APC'], description: 'For addProvider: PHY=physician, APC=nurse practitioner/PA.' },
+            tier: { type: 'string', enum: ['ft', 'pt', 'prn'], description: 'For setTier: employment tier — ft=full-time, pt=part-time, prn=as-needed.' },
             target: { type: 'integer', description: 'For addProvider: target shifts per month.' },
             value: { type: 'integer', description: 'For setCap/setTarget: shift count. For maxRun: max consecutive days.' },
             tod: { type: 'string', enum: ['day', 'eve', 'night'], description: 'Time-of-day restriction. day<12:00, eve 12-18, night 18:00+.' },
@@ -100,13 +101,14 @@ const CHAT_TOOL = {
 
 async function handleChat(env, payload) {
   const { text, site, siteName, month, people, pool } = payload;
-  const roster = (pool || []).map(p => `${p.who} (${p.role}${p.tod ? ', ' + p.tod + 's only' : ''}, target ${p.target})`).join('\n');
+  const tierName = t => ({ ft: 'full-time', pt: 'part-time', prn: 'PRN' }[t] || t);
+  const roster = (pool || []).map(p => `${p.who} (${p.role}${p.tier ? ', ' + tierName(p.tier) : ''}${p.tod ? ', ' + p.tod + 's only' : ''}, target ${p.target})`).join('\n');
   const others = (people || []).filter(n => !(pool || []).some(p => p.who === n)).slice(0, 400).join(', ');
   const system = [
     `You are the scheduling assistant for ${siteName || site}, ${month}. Translate the scheduler's plain-English request into structured operations.`,
     `Resolve names to the EXACT full name from the roster or the wider staff list. If a name is ambiguous or not found, return no ops and ask for clarification in the reply.`,
     `Dates must be ISO (YYYY-MM-DD) within ${month}. Understand relative phrasing: "the first week" = days 1-7, "last week" = final 7 days, weekday names, "weekends", ranges like "the 8th to the 12th".`,
-    `Operation guide: addProvider (needs role PHY/APC and a monthly target; include tod if they say "nights only" etc.); removeProvider; addOff (hard unavailable days); addPrefer (preferred days); setCap (max shifts); setTarget (monthly target); setTimeOfDay (nights/days/eves only); maxRun (global max consecutive days, no "who"); move (needs who, toWho, date — only if they name a specific shift to move).`,
+    `Operation guide: addProvider (needs role PHY/APC and a monthly target; include tod if they say "nights only" etc.); removeProvider; addOff (hard unavailable days); addPrefer (preferred days); setCap (max shifts); setTarget (monthly target); setTimeOfDay (nights/days/eves only); setTier (employment tier ft/pt/prn when they say someone is full-time, part-time, or PRN/as-needed — the schedule gives full-time preference over part-time, part-time over PRN); maxRun (global max consecutive days, no "who"); move (needs who, toWho, date — only if they name a specific shift to move).`,
     `Current roster:\n${roster || '(none)'}`,
     others ? `Other known staff who could be added or referenced: ${others}` : '',
   ].filter(Boolean).join('\n\n');
@@ -152,8 +154,9 @@ const GEN_TOOL = {
 
 async function handleGenerate(env, payload) {
   const { site, siteName, month, historyMonths, openSlots, providers, requests, rules } = payload;
+  const tierWord = t => ({ ft: 'full-time', pt: 'part-time', prn: 'PRN' }[t] || 'full-time');
   const provLines = (providers || []).map(p =>
-    `${p.who} — ${p.role}; avg ${p.avg?.toFixed ? p.avg.toFixed(1) : p.avg} days/mo over ${historyMonths || '3'} months; usual shift ${p.usual || 'mixed'}`).join('\n');
+    `${p.who} — ${p.role}; ${tierWord(p.tier)}; avg ${p.avg?.toFixed ? p.avg.toFixed(1) : p.avg} days/mo over ${historyMonths || '3'} months; usual shift ${p.usual || 'mixed'}`).join('\n');
   const reqLines = (requests || []).map(r => {
     const bits = [];
     if (r.off?.length) bits.push(`off ${r.off.join(',')}`);
@@ -166,6 +169,7 @@ async function handleGenerate(env, payload) {
     `You are a physician scheduler building the ${month} schedule for ${siteName || site}.`,
     `There are ${openSlots} open shifts to fill. Set each provider's monthly target so the schedule is fair and covers as much as possible.`,
     `Each provider's target MUST equal their recent average days worked (rounded), or exceed it by one or two when a request or shortage warrants. A target below a provider's average is INVALID OUTPUT — the only legitimate ways someone works less are their own stated cap or days off. Honor stated caps. Keep night people on nights.`,
+    `Shift-preference hierarchy: full-time providers get preference over part-time, and part-time over PRN. Fill full-time providers to their normal load first; PRN covers only what remains. When raising targets to close a gap, raise full-time first.`,
     `Write 6-12 specific notes: coverage gaps with numbers, fairness calls you made, requests you honored or couldn't, recruiting needs, and anything a scheduler would double-check.`,
     `If the site is understaffed, say so plainly and estimate how many more providers are needed rather than overloading people. Write for a scheduler, not an executive.`,
     rules ? `Standing rules: ${rules}` : '',
@@ -220,9 +224,10 @@ const REVIEW_TOOL = {
           additionalProperties: false,
           required: ['kind'],
           properties: {
-            kind: { type: 'string', enum: ['addProvider', 'removeProvider', 'addOff', 'addPrefer', 'setCap', 'setTarget', 'setTimeOfDay', 'maxRun', 'move'] },
+            kind: { type: 'string', enum: ['addProvider', 'removeProvider', 'addOff', 'addPrefer', 'setCap', 'setTarget', 'setTimeOfDay', 'setTier', 'maxRun', 'move'] },
             who: { type: 'string' },
             role: { type: 'string', enum: ['PHY', 'APC'] },
+            tier: { type: 'string', enum: ['ft', 'pt', 'prn'] },
             target: { type: 'integer' },
             value: { type: 'integer' },
             tod: { type: 'string', enum: ['day', 'eve', 'night'] },

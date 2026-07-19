@@ -457,6 +457,10 @@ table.reqcal td.cell-off { background: color-mix(in srgb, #cf2e2e 24%, var(--pan
 .rulenum { width: 68px; }
 td.underfloor { color: #ff7b7b; font-weight: 700; }
 .reviewbox { border-left: 4px solid var(--rh-purple); }
+.tiersel { font: inherit; font-size: 12px; padding: 3px 6px; border-radius: 6px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); }
+.tiersel.tier-ft { border-color: var(--rh-cyan); color: var(--rh-cyan); }
+.tiersel.tier-pt { border-color: var(--rh-yellow); color: var(--rh-yellow); }
+.tiersel.tier-prn { border-color: var(--ink-soft); color: var(--ink-soft); }
 .reviewround { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin-top: 10px; }
 .reviewround.clean { border-color: #00d084; background: color-mix(in srgb, #00d084 8%, var(--panel)); }
 .reviewround b { display: block; margin-bottom: 4px; font-size: 13px; }

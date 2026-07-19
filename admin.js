@@ -15,6 +15,7 @@ const EMPTY_OVERLAY = () => ({
   requests: [], contacts: {}, messages: [], trades: [], prefs: {}, notifs: [], reqSubmissions: [],
   adminDraft: { edits: {}, added: [], removed: [] },
   audit: [],
+  tiers: {},       // who -> 'ft' | 'pt' | 'prn' employment tier (shift-preference hierarchy)
   genAdjust: [],   // structured ops from the "talk to the schedule" box
   genChat: [],     // its conversation log
 });
@@ -111,6 +112,7 @@ function readOverlayFromStorage() {
   if (!overlay.audit) overlay.audit = [];
   if (!overlay.genAdjust) overlay.genAdjust = [];
   if (!overlay.genChat) overlay.genChat = [];
+  if (!overlay.tiers) overlay.tiers = {};
 }
 
 async function loadData(pin) {
@@ -1486,6 +1488,17 @@ function poolFor(site, mo) {
     .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false })), site), site, mo);
 }
 
+/* ---------- employment tiers (shift-preference hierarchy) ----------
+   full-time > part-time > PRN: when two providers are otherwise comparable,
+   the higher tier wins the shift. Set manually (provider table / chat) and
+   stored globally; unset providers default to full-time, floats to PRN. */
+const TIER_LABEL = { ft: 'Full-time', pt: 'Part-time', prn: 'PRN' };
+const TIER_BONUS = { ft: 40, pt: 20, prn: 0 };
+function tierOf(who, isFloat) {
+  const t = (overlay.tiers || {})[who];
+  return t === 'ft' || t === 'pt' || t === 'prn' ? t : (isFloat ? 'prn' : 'ft');
+}
+
 /* when Opus 4.8 produced per-provider targets for this exact site+month, use them.
    Opus may aim HIGHER than a provider's baseline but never lower — the floor rule
    (nobody below average − 1) hangs off the target, so a lowball target would quietly
@@ -1523,6 +1536,9 @@ function applyBackendOps(ops) {
       addAdjust('setTarget', { who, value: op.value }, `${first} target ${op.value}/mo`); n++;
     } else if (op.kind === 'setTimeOfDay' && who && op.tod) {
       addAdjust('setTimeOfDay', { who, tod: op.tod }, `${first} → ${op.tod}s only`); n++;
+    } else if (op.kind === 'setTier' && who && ['ft', 'pt', 'prn'].includes(op.tier)) {
+      overlay.tiers[who] = op.tier;
+      audit(`${who} employment tier set to ${TIER_LABEL[op.tier]} (via assistant)`, 'ai'); n++;
     } else if (op.kind === 'maxRun' && op.value) {
       overlay.genAdjust = overlay.genAdjust.filter(a => a.kind !== 'maxRun');
       addAdjust('maxRun', { value: op.value }, `max ${op.value} in a row (all sites)`, '*'); n++;
@@ -1576,12 +1592,13 @@ function runGeneration(site, mo) {
       let score = 0;
       if (!st.tod && st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
       /* floor rule: nobody ends the month below their average minus one — a
-         provider still under floor outbids every other consideration */
-      const floor = Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
+         provider still under floor outbids every other consideration.
+         PRN is exempt: "as needed" carries no guaranteed load. */
+      const floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
       if (st.dates.size < floor) score += 400 + (floor - st.dates.size) * 10;
       if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
       if (st.dates.has(addDays(slot.date, -1))) score += 45;                     // build blocks
-      score += p.float ? -8 : 12;                                                // regulars first
+      score += TIER_BONUS[tierOf(p.who, p.float)];                               // hierarchy: full-time > part-time > PRN
       score -= (st.assigned / Math.max(1, p.target)) * 70;                       // balance load
       if (score > bestScore) { best = p; bestScore = score; }
     }
@@ -1605,7 +1622,7 @@ function runGeneration(site, mo) {
     }
     st.longestRun = bestRun;
     const r = reqs.get(st.who);
-    st.floor = Math.max(0, Math.min(st.target - 1, (r && r.cap) || Infinity));
+    st.floor = tierOf(st.who, st.float) === 'prn' ? 0 : Math.max(0, Math.min(st.target - 1, (r && r.cap) || Infinity));
     st.underFloor = st.dates.size < st.floor;
   }
   const underFloor = [...stats.values()].filter(st => st.underFloor).map(st => st.who);
@@ -1926,7 +1943,7 @@ function renderScheduleChat(wrap) {
       try {
         const ctx = { text, site: g.site, siteName: siteName(g.site), month: g.month,
           people: [...new Set(base.map(s => s.who).filter(Boolean))],
-          pool: poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, target: p.target, tod: p.tod || null })) };
+          pool: poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, target: p.target, tod: p.tod || null, tier: tierOf(p.who, p.float) })) };
         const data = await backendCall('/api/chat', ctx);
         const n = applyBackendOps(data.ops);
         let tail = '';
@@ -2424,7 +2441,7 @@ async function stageGenerateClaude() {
        average when it's a credible signal, otherwise the planned-roster target.
        Sending the raw noisy average (e.g. 2 stray days at a forecast site) made
        Opus "honor" a phantom tiny load and lowball everyone. */
-    const providers = poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, avg: p.fromAvg && p.avg ? p.avg : p.target, usual: usualShift(profiles.get(p.who)) }));
+    const providers = poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, avg: p.fromAvg && p.avg ? p.avg : p.target, usual: usualShift(profiles.get(p.who)), tier: tierOf(p.who, p.float) }));
     const reqs = [...requestsFor(g.site, g.month).values()]
       .filter(r => providers.some(p => p.who === r.who) || r.source === 'example')
       .map(r => ({ who: r.who, off: [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), prefer: [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), cap: r.cap, note: r.note }));
@@ -2459,14 +2476,14 @@ function buildReviewPayload(res, round, priorFlags) {
     const r = res.reqs.get(st.who);
     const off = r ? [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)).join(',') : '';
     const prefer = r ? [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)).join(',') : '';
-    return `${st.who} — ${st.role}; target ${st.target}; assigned ${st.dates.size}; floor ${st.floor}; ` +
+    return `${st.who} — ${st.role}; ${TIER_LABEL[tierOf(st.who, st.float)]}; target ${st.target}; assigned ${st.dates.size}; floor ${st.floor}; ` +
       `${st.tod ? st.tod + 's (rule)' : usualShift(st.prof)}${off ? `; off ${off}` : ''}${prefer ? `; prefers ${prefer}` : ''}${r && r.cap ? `; cap ${r.cap}` : ''}`;
   });
   const assignments = res.assignments.map(a => `${a.slot.date} ${a.slot.start}–${a.slot.end} ${a.slot.pos} → ${a.who}`);
   const unfilled = res.unfilled.slice(0, 60).map(s => `${s.date} ${s.start}–${s.end} ${s.pos}`);
   return {
     site: g.site, siteName: siteName(g.site), month: g.month, round,
-    rules: `max ${res.maxRun} consecutive days; at least 10h between shifts; one shift per day; nobody below their floor (target−1); nobody above target+1; honor off days and time-of-day patterns`,
+    rules: `max ${res.maxRun} consecutive days; at least 10h between shifts; one shift per day; nobody below their floor (target−1); nobody above target+1; honor off days and time-of-day patterns; shift-preference hierarchy Full-time > Part-time > PRN (PRN fills only what remains after higher tiers)`,
     providers, assignments, unfilled, priorFlags,
   };
 }
@@ -2812,7 +2829,7 @@ function renderGenerate(main) {
     const provBox = el('div', 'reqform');
     provBox.append(el('h2', '', 'Proposed load by provider'));
     const pt = el('table', 'flat');
-    pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Usual shift</th><th>Assigned</th><th>Target (3-mo avg)</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
+    pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Tier</th><th>Usual shift</th><th>Assigned</th><th>Target (3-mo avg)</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
     const ptb = el('tbody');
     let anyPlanned = false;
     const rfNow = state.gen.roleFilter;
@@ -2822,6 +2839,26 @@ function renderGenerate(main) {
       if (s.float) tdN.append(el('span', 'floatpill', 'float'));
       tr.append(tdN);
       tr.append(el('td', '', s.role));
+      const tdT = el('td');
+      const curTier = tierOf(s.who, s.float);
+      const tierSel = document.createElement('select');
+      tierSel.className = 'tiersel tier-' + curTier;
+      for (const [k, label] of Object.entries(TIER_LABEL)) {
+        const o = el('option', '', label);
+        o.value = k;
+        if (curTier === k) o.selected = true;
+        tierSel.append(o);
+      }
+      tierSel.onchange = () => {
+        overlay.tiers[s.who] = tierSel.value;
+        audit(`${s.who} employment tier set to ${TIER_LABEL[tierSel.value]}`, 'ai');
+        saveOverlay();
+        g.result = runGeneration(g.site, g.month);
+        g.applied = false;
+        render();
+      };
+      tdT.append(tierSel);
+      tr.append(tdT);
       tr.append(el('td', '', s.tod ? ({ night: 'nights', day: 'days', eve: 'evenings' }[s.tod] + ' (rule)') : usualShift(s.prof)));
       const tdA = el('td', s.underFloor ? 'underfloor' : '', String(s.assigned));
       if (s.underFloor) { tdA.append(el('span', 'underfloor-tag', ` ⚠ below avg−1 (${s.dates.size}/${s.floor})`)); }
