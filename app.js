@@ -15,7 +15,6 @@ const DEFAULT_OVERLAY = () => ({ edits: {}, added: [], removed: [], requests: []
 let overlay = DEFAULT_OVERLAY();
 let state = {
   view: 'month',
-  weekStart: null,      // ISO date of a Sunday
   month: null,          // 'YYYY-MM'
   site: '',
   pos: '',
@@ -23,8 +22,9 @@ let state = {
   person: 'Blake Lovely, MD',
   viewAs: 'Blake Lovely, MD',   // '' = everyone (full schedule)
   expandedDays: new Set(),
+  selDay: null,          // phone month grid: tapped day showing its detail card
   reqSub: 'prefs',       // Requests hub section: 'prefs' | 'trades' | 'open'
-  showEveryone: false,   // month/week in employee view: false = my shifts, true = everyone at my sites
+  showEveryone: false,   // month in employee view: false = my shifts, true = everyone at my sites
 };
 
 /* ---------- notifications ---------- */
@@ -250,11 +250,6 @@ function addDays(iso, n) {
   const dt = new Date(Date.UTC(y, m - 1, d + n));
   return dt.toISOString().slice(0, 10);
 }
-function sundayOf(iso) {
-  const [y, m, d] = iso.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  return addDays(iso, -dt.getUTCDay());
-}
 function hours(s) {
   const [sh, sm] = s.start.split(':').map(Number);
   const [eh, em] = s.end.split(':').map(Number);
@@ -290,11 +285,6 @@ function addProviderRoleClass(node, role) {
 
 /* ---------- filter bar ---------- */
 
-function weekList() {
-  const dates = new Set(shifts().map(s => sundayOf(s.date)));
-  return [...dates].sort();
-}
-
 function monthList() {
   const months = new Set(shifts().map(s => s.date.slice(0, 7)));
   return [...months].sort();
@@ -306,30 +296,17 @@ function fmtMonth(mo) {
 }
 
 function renderFilterBar() {
-  const weeks = weekList();
-  if (!state.weekStart) {
-    state.weekStart = weeks.includes(sundayOf(TODAY)) ? sundayOf(TODAY) : weeks[0];
-  }
   const months = monthList();
   if (!state.month) {
     state.month = months.includes(TODAY.slice(0, 7)) ? TODAY.slice(0, 7) : months[0];
   }
   const ws = $('#weekSelect');
   ws.innerHTML = '';
-  if (state.view === 'month' || state.view === 'requests') {
-    for (const mo of months) {
-      const o = el('option', '', fmtMonth(mo));
-      o.value = mo;
-      if (mo === state.month) o.selected = true;
-      ws.append(o);
-    }
-  } else {
-    for (const w of weeks) {
-      const o = el('option', '', `Week of ${fmtDate(w)}`);
-      o.value = w;
-      if (w === state.weekStart) o.selected = true;
-      ws.append(o);
-    }
+  for (const mo of months) {
+    const o = el('option', '', fmtMonth(mo));
+    o.value = mo;
+    if (mo === state.month) o.selected = true;
+    ws.append(o);
   }
   const va = $('#viewAsSelect');
   const people = [...new Set(base.map(s => s.who).filter(Boolean))].sort();
@@ -354,9 +331,9 @@ function renderFilterBar() {
     if (s === state.site) o.selected = true;
     sf.append(o);
   }
-  /* scope toggle: only meaningful in employee view on month/week */
+  /* scope toggle: only meaningful in employee view on the month schedule */
   const st = $('#scopeToggle');
-  const toggleable = state.viewAs && (state.view === 'month' || state.view === 'week');
+  const toggleable = state.viewAs && state.view === 'month';
   st.hidden = !toggleable;
   if (toggleable) {
     st.textContent = state.showEveryone ? 'Show My Schedule Only' : 'Show Everyone Working';
@@ -370,7 +347,7 @@ function renderFilterBar() {
   const pf = $('#posFilter');
   let list = state.site ? base.filter(s => s.site === state.site) : base;
   if (state.viewAs) {
-    if (state.showEveryone && (state.view === 'month' || state.view === 'week')) {
+    if (state.showEveryone && state.view === 'month') {
       const ms = employeeSites(state.viewAs);
       list = list.filter(s => s.site && ms.has(s.site));
     } else {
@@ -397,7 +374,7 @@ function renderDatalists() {
   $('#siteList').innerHTML = sites.map(p => `<option value="${p}">`).join('');
 }
 
-/* ---------- week grid view ---------- */
+/* ---------- schedule chips ---------- */
 
 function openShiftFromSchedule(s) {
   if (!state.viewAs) {
@@ -432,61 +409,16 @@ function chipFor(s, opts = {}) {
   return b;
 }
 
-/* ---------- phone agenda (stacked day cards instead of 7-col grids) ---------- */
+/* ---------- phone month calendar: whole month in one grid + tap-a-day detail ---------- */
 
-const AGENDA_COLLAPSED = 4;
+const DETAIL_COLLAPSED = 8;
 
-function renderAgenda(main, days, byDay, chipFn, opts = {}) {
-  const collapse = opts.collapse || AGENDA_COLLAPSED;
-  const wrap = el('div', 'agenda');
-  const q = state.search.toLowerCase();
-  for (const iso of days) {
-    const cell = (byDay.get(iso) || []).slice()
-      .sort((a, b) => a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
-    const pref = opts.prefFor ? opts.prefFor(iso) : null;
-    if (!cell.length && !pref && opts.skipEmpty) continue;
-    const card = el('div', 'aday' + (iso === TODAY ? ' today' : ''));
-    const head = el('div', 'adayhead');
-    head.append(el('span', 'adayname', fmtDateLong(iso)));
-    if (iso === TODAY) head.append(el('span', 'todaytag', 'Today'));
-    const openCount = cell.filter(s => !s.who).length;
-    if (openCount) head.append(el('span', 'opendot', `${openCount} open`));
-    card.append(head);
-    if (pref === 'no') card.append(el('span', 'offday off-pending', 'marked off'));
-    // with a search active, surface matching shifts instead of the first N
-    const ordered = q
-      ? [...cell].sort((a, b) => (matchesSearch(b, q) ? 1 : 0) - (matchesSearch(a, q) ? 1 : 0))
-      : cell;
-    const expanded = state.expandedDays.has(iso);
-    const show = expanded ? ordered : ordered.slice(0, collapse);
-    for (const s of show) card.append(chipFn(s));
-    if (ordered.length > collapse) {
-      const more = el('button', 'morebtn', expanded ? 'show less' : `+${ordered.length - collapse} more`);
-      more.onclick = () => {
-        if (expanded) state.expandedDays.delete(iso); else state.expandedDays.add(iso);
-        render();
-      };
-      card.append(more);
-    }
-    if (!cell.length && pref !== 'no') card.append(el('div', 'anone', 'No shifts'));
-    if (!state.viewAs && opts.addable) {
-      const add = el('button', 'addbtn agenda-add', '+ add shift');
-      add.onclick = () => openDialog(null, { date: iso, pos: state.pos || '', site: state.site || '' });
-      card.append(add);
-    }
-    wrap.append(card);
-  }
-  if (!wrap.children.length) {
-    main.append(el('div', 'empty', opts.emptyText || 'Nothing in this period.'));
-    return;
-  }
-  main.append(wrap);
-}
+const shortTime = t => String(Number(t.slice(0, 2)));
 
-function monthDays(mo) {
-  const [y, m] = mo.split('-').map(Number);
-  const daysIn = new Date(y, m, 0).getDate();
-  return Array.from({ length: daysIn }, (_, i) => `${mo}-${String(i + 1).padStart(2, '0')}`);
+function cellTimePill(s, extraClass) {
+  const p = el('span', 'cellpill' + (extraClass ? ' ' + extraClass : ''), `${shortTime(s.start)}–${shortTime(s.end)}`);
+  p.style.setProperty('--site', siteColor(s.site));
+  return p;
 }
 
 function prefMarkerFor(iso) {
@@ -494,77 +426,73 @@ function prefMarkerFor(iso) {
   return (overlay.prefs[state.viewAs] || {})[iso] === 'no' ? 'no' : null;
 }
 
-function renderWeek(main) {
-  const days = Array.from({ length: 7 }, (_, i) => addDays(state.weekStart, i));
-  const list = scoped(filtered(shifts())).filter(s => s.date >= days[0] && s.date <= days[6]);
+/* opts: cellMarks(iso, cell) → small nodes inside each day cell;
+   detailChip(shift) → full chip for the tapped day's card;
+   collapse, addable, prefFor as in the grid views */
+function phoneMonthCal(main, mo, byDay, opts) {
+  const collapse = opts.collapse || DETAIL_COLLAPSED;
+  if (state.selDay && !state.selDay.startsWith(mo)) state.selDay = null;
+  const sel = state.selDay || (TODAY.startsWith(mo) ? TODAY : null);
 
-  const open = list.filter(s => !s.who).length;
-  $('#weekStats').textContent = !state.viewAs
-    ? `${list.length.toLocaleString()} shifts · ${open} open`
-    : state.showEveryone
-      ? `${list.length.toLocaleString()} shifts at my sites · ${open} open`
-      : `${list.length} shifts · ${Math.round(list.reduce((a, s) => a + hours(s), 0))}h`;
-
-  if (!list.length) {
-    main.append(el('div', 'empty', 'No shifts match these filters this week.'));
-    return;
-  }
-
-  if (isPhone()) {
-    const byDay = new Map();
-    for (const s of list) {
-      if (!byDay.has(s.date)) byDay.set(s.date, []);
-      byDay.get(s.date).push(s);
-    }
-    const mineOnly = state.viewAs && !state.showEveryone;
-    renderAgenda(main, days, byDay, s => chipFor(s, { showPos: true }), {
-      collapse: mineOnly ? Infinity : AGENDA_COLLAPSED,
-      prefFor: prefMarkerFor,
-      addable: true,
-    });
-    return;
-  }
-
-  const byPos = new Map();
-  for (const s of list) {
-    if (!byPos.has(s.pos)) byPos.set(s.pos, []);
-    byPos.get(s.pos).push(s);
-  }
-  const positions = [...byPos.keys()].sort();
-
-  const wrap = el('div', 'gridwrap');
-  const table = el('table', 'sched');
-  const thead = el('thead');
+  const [y, m] = mo.split('-').map(Number);
+  const table = el('table', 'bigcal phonecal');
   const hr = el('tr');
-  hr.append(el('th', 'poscol', 'Position'));
-  for (const d of days) {
-    const th = el('th', d === TODAY ? 'today' : '', fmtDateLong(d));
-    hr.append(th);
+  for (const d of ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']) hr.append(el('th', '', d));
+  table.append(hr);
+  const first = new Date(Date.UTC(y, m - 1, 1));
+  const daysIn = new Date(y, m, 0).getDate();
+  let tr = el('tr');
+  for (let i = 0; i < first.getUTCDay(); i++) tr.append(el('td', 'off'));
+  for (let day = 1; day <= daysIn; day++) {
+    const iso = `${mo}-${String(day).padStart(2, '0')}`;
+    const td = el('td', (iso === TODAY ? 'today' : '') + (iso === sel ? ' sel' : ''));
+    td.append(el('div', 'dn', String(day)));
+    for (const node of opts.cellMarks(iso, byDay.get(iso) || [])) td.append(node);
+    td.onclick = () => { state.selDay = iso; render(); };
+    tr.append(td);
+    if ((first.getUTCDay() + day) % 7 === 0) { table.append(tr); tr = el('tr'); }
   }
-  thead.append(hr);
-  table.append(thead);
+  if (tr.children.length) { while (tr.children.length < 7) tr.append(el('td', 'off')); table.append(tr); }
+  main.append(table);
 
-  const tbody = el('tbody');
-  for (const pos of positions) {
-    const tr = el('tr');
-    tr.append(el('th', 'poscol', pos));
-    for (const d of days) {
-      const td = el('td', 'slot');
-      const cell = byPos.get(pos).filter(s => s.date === d)
-        .sort((a, b) => a.start.localeCompare(b.start));
-      for (const s of cell) td.append(chipFor(s));
-      if (!state.viewAs) {
-        const add = el('button', 'addbtn', '+ add');
-        add.onclick = () => openDialog(null, { date: d, pos, site: cell[0]?.site || state.site || '' });
-        td.append(add);
-      }
-      tr.append(td);
-    }
-    tbody.append(tr);
+  if (!sel) {
+    main.append(el('div', 'daydetail-hint', 'Tap a day to see its details.'));
+    return;
   }
-  table.append(tbody);
-  wrap.append(table);
-  main.append(wrap);
+  const cell = (byDay.get(sel) || []).slice()
+    .sort((a, b) => a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
+  const card = el('div', 'aday daydetail' + (sel === TODAY ? ' today' : ''));
+  const head = el('div', 'adayhead');
+  head.append(el('span', 'adayname', fmtDateLong(sel)));
+  if (sel === TODAY) head.append(el('span', 'todaytag', 'Today'));
+  const openCount = cell.filter(s => !s.who).length;
+  if (openCount) head.append(el('span', 'opendot', `${openCount} open`));
+  card.append(head);
+  const pref = opts.prefFor ? opts.prefFor(sel) : null;
+  if (pref === 'no') card.append(el('span', 'offday off-pending', 'marked off'));
+  // with a search active, surface matching shifts instead of the first N
+  const q = state.search.toLowerCase();
+  const ordered = q
+    ? [...cell].sort((a, b) => (matchesSearch(b, q) ? 1 : 0) - (matchesSearch(a, q) ? 1 : 0))
+    : cell;
+  const expanded = state.expandedDays.has(sel);
+  const show = expanded ? ordered : ordered.slice(0, collapse);
+  for (const s of show) card.append(opts.detailChip(s));
+  if (ordered.length > collapse) {
+    const more = el('button', 'morebtn', expanded ? 'show less' : `+${ordered.length - collapse} more`);
+    more.onclick = () => {
+      if (expanded) state.expandedDays.delete(sel); else state.expandedDays.add(sel);
+      render();
+    };
+    card.append(more);
+  }
+  if (!cell.length && pref !== 'no') card.append(el('div', 'anone', 'No shifts'));
+  if (!state.viewAs && opts.addable) {
+    const add = el('button', 'addbtn agenda-add', '+ add shift');
+    add.onclick = () => openDialog(null, { date: sel, pos: state.pos || '', site: state.site || '' });
+    card.append(add);
+  }
+  main.append(card);
 }
 
 /* ---------- month view (default) ---------- */
@@ -613,12 +541,24 @@ function renderMonthAll(main) {
 
   if (isPhone()) {
     const mineOnly = state.viewAs && !state.showEveryone;
-    renderAgenda(main, monthDays(mo), byDay, s => chipFor(s, { showPos: true }), {
-      collapse: mineOnly ? Infinity : AGENDA_COLLAPSED,
-      skipEmpty: mineOnly,
+    phoneMonthCal(main, mo, byDay, {
+      detailChip: s => chipFor(s, { showPos: true }),
+      collapse: mineOnly ? Infinity : DETAIL_COLLAPSED,
       prefFor: prefMarkerFor,
       addable: true,
-      emptyText: `No shifts for this view in ${fmtMonth(mo)}.`,
+      cellMarks: (iso, cell) => {
+        const out = [];
+        if (mineOnly) {
+          for (const s of cell.slice(0, 3)) out.push(cellTimePill(s));
+          if (cell.length > 3) out.push(el('span', 'cellmore', `+${cell.length - 3}`));
+        } else {
+          if (cell.length) out.push(el('span', 'cellcount', cell.length.toLocaleString()));
+          const openCount = cell.filter(s => !s.who).length;
+          if (openCount) out.push(el('span', 'cellcount open', `${openCount} open`));
+        }
+        if (prefMarkerFor(iso) === 'no') out.push(el('span', 'cellpill off', 'off'));
+        return out;
+      },
     });
     return;
   }
@@ -1323,9 +1263,17 @@ function renderSwap(main) {
   }
 
   if (isPhone()) {
-    renderAgenda(main, monthDays(mo), byDay, s => swapChip(s, tradeByShift.get(s.id), mine), {
-      skipEmpty: true,
-      emptyText: `Nothing to swap or pick up at your sites in ${fmtMonth(mo)}.`,
+    phoneMonthCal(main, mo, byDay, {
+      detailChip: s => swapChip(s, tradeByShift.get(s.id), mine),
+      cellMarks: (iso, cell) => {
+        const out = [];
+        for (const s of cell.filter(x => x.who === mine).slice(0, 2)) out.push(cellTimePill(s, 'mine'));
+        const openCount = cell.filter(s => !s.who && s.date >= TODAY).length;
+        if (openCount) out.push(el('span', 'cellcount open', `${openCount} open`));
+        const offered = cell.filter(s => s.who && s.who !== mine && tradeByShift.get(s.id)?.status === 'open' && s.date >= TODAY).length;
+        if (offered) out.push(el('span', 'cellcount offered', `${offered} swap`));
+        return out;
+      },
     });
     return;
   }
@@ -1704,14 +1652,11 @@ function exportCsv() {
   let list = filtered(shifts());
   if (state.view === 'month') {
     list = list.filter(s => s.date.startsWith(state.month));
-  } else if (state.view === 'week') {
-    const end = addDays(state.weekStart, 6);
-    list = list.filter(s => s.date >= state.weekStart && s.date <= end);
   } else if (state.view === 'requests' && state.reqSub === 'open') {
     list = list.filter(s => !s.who && s.date >= TODAY);
   }
   const openSub = state.view === 'requests' && state.reqSub === 'open';
-  const everyoneScope = state.showEveryone && (state.view === 'month' || state.view === 'week');
+  const everyoneScope = state.showEveryone && state.view === 'month';
   if (state.viewAs && !openSub && state.view !== 'people') {
     if (everyoneScope) {
       const ms = employeeSites(state.viewAs);
@@ -1740,14 +1685,13 @@ function wireChrome() {
   const todayBtn = $('#todayBtn');
   if (todayBtn) {
     todayBtn.onclick = () => {
-      state.weekStart = sundayOf(TODAY);
       state.month = TODAY.slice(0, 7);
+      state.selDay = TODAY;
       render();
     };
   }
   $('#weekSelect').onchange = e => {
-    if (state.view === 'month' || state.view === 'requests') state.month = e.target.value;
-    else state.weekStart = e.target.value;
+    state.month = e.target.value;
     render();
   };
   $('#siteFilter').onchange = e => { state.site = e.target.value; state.pos = ''; render(); };
@@ -1791,22 +1735,16 @@ function wireChrome() {
 }
 
 function shiftPeriod(n) {
-  if (state.view === 'month' || state.view === 'requests') {
-    const months = monthList();
-    const i = months.indexOf(state.month);
-    state.month = months[Math.min(Math.max(i + n, 0), months.length - 1)];
-  } else {
-    const weeks = weekList();
-    const i = weeks.indexOf(state.weekStart);
-    state.weekStart = weeks[Math.min(Math.max(i + n, 0), weeks.length - 1)];
-  }
+  const months = monthList();
+  const i = months.indexOf(state.month);
+  state.month = months[Math.min(Math.max(i + n, 0), months.length - 1)];
   render();
 }
 
 function setView(v) {
   state.view = v;
   document.querySelectorAll('#viewTabs button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
-  const periodControls = v === 'week' || v === 'month' || v === 'requests';
+  const periodControls = v === 'month' || v === 'requests';
   $('#filterBar').querySelector('.weeknav').style.display = periodControls ? '' : 'none';
   render();
 }
@@ -1864,7 +1802,6 @@ function render() {
   const main = $('#main');
   main.innerHTML = '';
   if (state.view === 'month') renderMonthAll(main);
-  else if (state.view === 'week') renderWeek(main);
   else if (state.view === 'requests') renderRequestsHub(main);
   else if (state.view === 'contact') renderContact(main);
   else renderPeople(main);

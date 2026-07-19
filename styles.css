@@ -331,37 +331,7 @@ main { padding: 0 18px 44px; }
 }
 .morebtn:hover { text-decoration: underline; }
 
-/* ---- week grid ---- */
-.gridwrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
-table.sched { border-collapse: collapse; width: 100%; min-width: 1100px; }
-table.sched th, table.sched td {
-  border: 1px solid var(--line);
-  vertical-align: top;
-  padding: 4px;
-}
-table.sched thead th {
-  position: sticky;
-  top: 0;
-  background: var(--panel);
-  z-index: 5;
-  padding: 8px 6px;
-  font-size: 13px;
-  border-bottom: 2px solid var(--rh-cyan);
-}
-table.sched thead th.today { color: var(--rh-blue); }
-th.poscol {
-  text-align: left;
-  min-width: 170px;
-  max-width: 210px;
-  font-weight: 600;
-  font-size: 12.5px;
-  background: color-mix(in srgb, var(--bg) 60%, var(--panel));
-  position: sticky;
-  left: 0;
-  z-index: 4;
-}
-td.slot { min-width: 128px; }
-td.slot .addbtn, .bigcal .addbtn {
+.bigcal .addbtn {
   visibility: hidden;
   border: 1px dashed var(--line);
   color: var(--ink-soft);
@@ -372,7 +342,7 @@ td.slot .addbtn, .bigcal .addbtn {
   border-radius: 6px;
   margin-top: 2px;
 }
-td.slot:hover .addbtn, .bigcal td:hover .addbtn { visibility: visible; }
+.bigcal td:hover .addbtn { visibility: visible; }
 
 .chip {
   display: block;
@@ -722,8 +692,42 @@ dialog h2 { margin: 0 0 12px; font-size: 16px; color: var(--rh-blue); }
 
 .empty { text-align: center; color: var(--ink-soft); padding: 50px 0; }
 
-/* ---- phone agenda (rendered on small screens instead of the 7-col grids) ---- */
-.agenda { display: flex; flex-direction: column; gap: 10px; }
+/* ---- phone month grid + tap-a-day detail (rendered on small screens) ---- */
+.phonecal td { cursor: pointer; }
+.phonecal td.off { cursor: default; }
+.phonecal td.sel {
+  background: color-mix(in srgb, var(--rh-cyan) 15%, var(--panel));
+  outline: 2px solid var(--rh-cyan);
+  outline-offset: -2px;
+}
+.phonecal td.today .dn { color: #78eaff; }
+.cellpill {
+  display: block;
+  margin-top: 2px;
+  padding: 1px 2px;
+  border-left: 2px solid var(--site, #888);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--site, #888) 28%, var(--panel));
+  font-size: 9px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
+}
+.cellpill.mine { border-left-color: var(--rh-cyan); background: color-mix(in srgb, var(--rh-cyan) 24%, var(--panel)); }
+.cellpill.off { border-left-color: var(--rh-yellow); background: color-mix(in srgb, var(--rh-yellow) 20%, var(--panel)); color: var(--rh-yellow); }
+.cellmore, .cellcount {
+  display: block;
+  margin-top: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--ink-soft);
+}
+.cellcount.open { color: var(--open-line); }
+.cellcount.offered { color: #b985ff; }
+.daydetail { margin-top: 10px; }
+.daydetail-hint { padding: 14px 0; color: var(--ink-soft); font-size: 12.5px; text-align: center; }
 .aday {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -829,7 +833,6 @@ button, select { touch-action: manipulation; }
   }
   .tabs button::before { font-size: 17px; line-height: 1.2; }
   #viewTabs [data-view="month"]::before { content: '🗓️'; }
-  #viewTabs [data-view="week"]::before { content: '📆'; }
   #viewTabs [data-view="people"]::before { content: '👥'; }
   #viewTabs [data-view="requests"]::before { content: '🔁'; }
   #viewTabs [data-view="contact"]::before { content: '💬'; }
@@ -898,10 +901,9 @@ button, select { touch-action: manipulation; }
 }
 
 @media print {
-  .topbar .top-actions, .filterbar .weeknav button, .foot, .tabs, td.slot .addbtn, .bigcal .addbtn { display: none !important; }
+  .topbar .top-actions, .filterbar .weeknav button, .foot, .tabs, .bigcal .addbtn { display: none !important; }
   body { background: #fff; }
   .topbar { background: #fff; color: #000; box-shadow: none; }
   .brand h1 { color: #000; }
-  .gridwrap { border: 0; overflow: visible; box-shadow: none; }
   main { padding: 0; }
 }
