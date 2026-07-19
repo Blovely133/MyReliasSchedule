@@ -18,6 +18,7 @@ const EMPTY_OVERLAY = () => ({
   tiers: {},       // who -> 'ft' | 'pt' | 'prn' employment tier (shift-preference hierarchy)
   genAdjust: [],   // structured ops from the "talk to the schedule" box
   genChat: [],     // its conversation log
+  analyze: null,   // mined-rule set from the Analyze pass (window, rules per provider, modes)
 });
 
 let base = [];          // [{id,date,pos,start,end,who,site,note}]
@@ -33,7 +34,7 @@ let state = {
   selDay: null,         // phone month grid: tapped day showing its detail card
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
-  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null },
+  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null, backtest: null },
 };
 
 /* Site codes → full facility names, from WhenToWork's category list */
@@ -1562,6 +1563,7 @@ function runGeneration(site, mo) {
   const reqs = requestsFor(site, mo);
   const profiles = timeProfiles();
   const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  const minedMap = compileMinedRules();
   const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
   for (const s of all) {
     if (!s.who || !s.date.startsWith(mo)) continue;
@@ -1573,6 +1575,7 @@ function runGeneration(site, mo) {
   const capsHit = new Set();
   for (const slot of slots) {
     const need = slotRole(slot.pos);
+    const slotDow = dowOf(slot.date);
     let best = null, bestScore = -Infinity;
     for (const p of pool) {
       if (need !== 'ANY' && p.role !== 'ANY' && p.role !== need) continue;
@@ -1590,7 +1593,10 @@ function runGeneration(site, mo) {
       const bucket = shiftBucket(slot);
       if (st.tod) { if (bucket !== st.tod) continue; }                           // hard: assistant rule ("nights only")
       else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
+      const mined = minedMap.get(p.who);
+      if (mined && minedBlocks(mined, slot, slotDow)) continue;                  // hard: mined-from-history rules
       let score = 0;
+      if (mined) score += minedScore(mined, slot, slotDow);                      // soft: mined-from-history rules
       if (!st.tod && st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
       /* floor rule: nobody ends the month below their average minus one — a
          provider still under floor outbids every other consideration.
@@ -1598,7 +1604,7 @@ function runGeneration(site, mo) {
       const floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
       if (st.dates.size < floor) score += 400 + (floor - st.dates.size) * 10;
       if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
-      if (st.dates.has(addDays(slot.date, -1))) score += 45;                     // build blocks
+      if (st.dates.has(addDays(slot.date, -1))) score += Math.round(45 * (mined ? mined.blockMult : 1));  // build blocks (mined style scales it)
       score += TIER_BONUS[tierOf(p.who, p.float)];                               // hierarchy: full-time > part-time > PRN
       score -= (st.assigned / Math.max(1, p.target)) * 70;                       // balance load
       if (score > bestScore) { best = p; bestScore = score; }
@@ -1665,27 +1671,46 @@ function loadHighs() {
   return highsLoad;
 }
 
-async function runGenerationSolver(site, mo) {
+async function runGenerationSolver(site, mo, opts = {}) {
   const t0 = performance.now();
   const highs = await loadHighs();
 
-  /* identical inputs to the greedy engine */
+  /* identical inputs to the greedy engine — or explicit overrides (backtest) */
   const all = adminShifts();
-  const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && !s.who);
-  const slots = openHere.filter(s => slotRole(s.pos) !== 'SKIP')
-    .sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
-  const skipped = openHere.length - slots.length;
-  const pool = poolFor(site, mo);
-  const reqs = requestsFor(site, mo);
-  const profiles = timeProfiles();
-  const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  let slots, skipped;
+  if (opts.slots) {
+    slots = opts.slots.slice().sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
+    skipped = 0;
+  } else {
+    const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && !s.who);
+    slots = openHere.filter(s => slotRole(s.pos) !== 'SKIP')
+      .sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
+    skipped = openHere.length - slots.length;
+  }
+  const pool = opts.pool || poolFor(site, mo);
+  const reqs = opts.reqs || requestsFor(site, mo);
+  const profiles = opts.profiles || timeProfiles();
+  const maxRun = opts.maxRun || (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  const minedMap = opts.minedMap || compileMinedRules();
   const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
-  for (const s of all) {
+  for (const s of (opts.monthShifts || all)) {
     if (!s.who || !s.date.startsWith(mo)) continue;
     const st = stats.get(s.who);
     if (st) { st.dates.add(s.date); st.shiftByDate.set(s.date, s); }
   }
   const daysIn = new Date(Number(mo.slice(0, 4)), Number(mo.slice(5, 7)), 0).getDate();
+  /* rotation-phase anchoring: worked days just OUTSIDE the month feed the rest,
+     max-run, and block-adjacency logic (a 7-on block ending the 31st should
+     continue, not restart) — but never the month's load/floor counts */
+  const mStart = mo + '-01';
+  const mEnd = `${mo}-${String(daysIn).padStart(2, '0')}`;
+  const loEdge = addDays(mStart, -6), hiEdge = addDays(mEnd, 6);
+  for (const s of (opts.edgeShifts || all)) {
+    if (!s.who || s.date.startsWith(mo) || s.date < loEdge || s.date > hiEdge) continue;
+    const st = stats.get(s.who);
+    if (st && !st.shiftByDate.has(s.date)) st.shiftByDate.set(s.date, s);
+  }
+  const dayNumOf = iso => Math.round((Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8)) - Date.UTC(+mo.slice(0, 4), +mo.slice(5, 7) - 1, 1)) / 86400000) + 1;
 
   /* decision variables: x{provider}_{slot} for every legal pairing, with the
      greedy engine's scoring terms as the per-assignment reward */
@@ -1704,6 +1729,7 @@ async function runGenerationSolver(site, mo) {
   slots.forEach((slot, si) => {
     const need = slotRole(slot.pos);
     const day = +slot.date.slice(8);
+    const dow = dowOf(slot.date);
     const bucket = shiftBucket(slot);
     for (const pr of byProv.values()) {
       const { p, pi, st, r } = pr;
@@ -1716,9 +1742,12 @@ async function runGenerationSolver(site, mo) {
       if (next && absMin(next.date, next.start) - shiftEndMin(slot) < MIN_REST_MIN) continue;
       if (st.tod) { if (bucket !== st.tod) continue; }                         // hard: "nights only" rule
       else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
+      const mined = minedMap.get(p.who);
+      if (mined && minedBlocks(mined, slot, dow)) continue;                    // hard: mined-from-history rules
       let reward = 1000 + TIER_BONUS[tierOf(p.who, p.float)];                  // fill first, tier breaks ties
       if (!st.tod && st.prof && st.prof.total >= 4) reward += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);
       if (r && r.prefer.has(slot.date)) reward += 100;
+      if (mined) reward += minedScore(mined, slot, dow);                       // soft: mined-from-history rules
       const name = `x${pi}_${si}`;
       cols.push({ name, who: p.who, si, slot, reward });
       pr.names.push(name);
@@ -1772,9 +1801,11 @@ async function runGenerationSolver(site, mo) {
       }
     }
 
-    /* max consecutive days, counting pre-existing shifts in the month */
+    /* max consecutive days, counting pre-existing shifts in the month AND the
+       anchored edge days just outside it (runs must not restart at the seam) */
     const preDay = new Set([...st.dates].map(d => +d.slice(8)));
-    for (let i = 1; i + maxRun <= daysIn; i++) {
+    for (const d of st.shiftByDate.keys()) if (!d.startsWith(mo)) preDay.add(dayNumOf(d));
+    for (let i = 1 - maxRun; i <= daysIn; i++) {
       const terms = [];
       let constC = 0;
       for (let d = i; d <= i + maxRun; d++) {
@@ -1801,14 +1832,19 @@ async function runGenerationSolver(site, mo) {
       obj.push(`- 40 o${pi}`);
     }
 
-    /* block scheduling: reward back-to-back worked days (greedy's +45) */
-    for (const [day, w] of wByDay) {
-      const left = wByDay.get(day - 1) || (preDay.has(day - 1) ? true : null);
-      if (!left) continue;
-      const a = `a${pi}_${day}`;
-      addCon(`${a} - ${w} <= 0`);
-      if (left !== true) addCon(`${a} - ${left} <= 0`);
-      obj.push(`+ 45 ${a}`);
+    /* block scheduling: reward back-to-back worked days (greedy's +45),
+       scaled by the provider's mined block style (7-on folks get double,
+       scattered-singles folks nearly none) */
+    const blockW = Math.round(45 * ((minedMap.get(p.who) || {}).blockMult ?? 1));
+    if (blockW > 0) {
+      for (const [day, w] of wByDay) {
+        const left = wByDay.get(day - 1) || (preDay.has(day - 1) ? true : null);
+        if (!left) continue;
+        const a = `a${pi}_${day}`;
+        addCon(`${a} - ${w} <= 0`);
+        if (left !== true) addCon(`${a} - ${left} <= 0`);
+        obj.push(`+ ${blockW} ${a}`);
+      }
     }
   }
 
@@ -1873,6 +1909,349 @@ function rebuildProposal(site, mo) {
     g.result = res;
     render();
   }).catch(() => {});   // greedy preview already on screen
+}
+
+/* ---------- Analyze: mine the real 6-month schedules into rules ----------
+   Deterministic pattern mining over every human-made assignment (no AI in the
+   loop): weekday shape, weekend rhythm, block style, and position loyalty per
+   provider, each with support (observations) and confidence. Near-certain
+   patterns become HARD rules (eligibility filters); consistent-but-not-total
+   ones become SOFT rules (objective coefficients). The scheduler can cycle any
+   chip hard → soft → off — history encodes real constraints AND accidents, so
+   the human gets the last word. Everything feeds the same MILP. */
+
+function dowOf(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+const DOW_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function mineHistory(excludeMo) {
+  const days = new Map();       // who -> Set(date)
+  const posCount = new Map();   // who -> Map(pos -> shifts)
+  let minD = null, maxD = null;
+  for (const s of base) {
+    if (s.forecast || !s.who || slotRole(s.pos) === 'SKIP') continue;
+    if (excludeMo && s.date.startsWith(excludeMo)) continue;
+    if (!minD || s.date < minD) minD = s.date;
+    if (!maxD || s.date > maxD) maxD = s.date;
+    if (!days.has(s.who)) { days.set(s.who, new Set()); posCount.set(s.who, new Map()); }
+    days.get(s.who).add(s.date);
+    const pc = posCount.get(s.who);
+    pc.set(s.pos, (pc.get(s.pos) || 0) + 1);
+  }
+  const rules = {};
+  for (const [who, dset] of days) {
+    const n = dset.size;
+    if (n < 8) continue;   // too little history to say anything
+    const list = [...dset].sort();
+    const dow = [0, 0, 0, 0, 0, 0, 0];
+    let wk = 0;
+    for (const d of list) { const w = dowOf(d); dow[w]++; if (w === 0 || w === 6) wk++; }
+    const out = [];
+    const first = who.replace(/,.*$/, '');
+    /* hard: weekdays they have NEVER worked (needs real support) */
+    const neverDays = [];
+    if (n >= 20) for (let d = 0; d < 7; d++) if (dow[d] === 0) neverDays.push(d);
+    const wkNever = neverDays.includes(0) && neverDays.includes(6);
+    const weekdayNever = neverDays.filter(d => d !== 0 && d !== 6);
+    if (wkNever) out.push({ kind: 'weekendNever', mode: 'hard', conf: 1, support: n, text: `${first}: never works weekends (0 of ${n} days)` });
+    if (weekdayNever.length && weekdayNever.length <= 3) out.push({ kind: 'dowNever', days: weekdayNever, mode: 'hard', conf: 1, support: n, text: `${first}: never works ${weekdayNever.map(d => DOW_NAMES[d]).join('/')} (0 of ${n} days)` });
+    /* soft: weekend appetite (when not already hard-never) */
+    const share = wk / n;
+    if (!wkNever) {
+      if (share < 0.10 && n >= 15) out.push({ kind: 'weekendBias', dir: -30, mode: 'soft', conf: Math.min(1, 1 - share / 0.29), support: n, text: `${first}: avoids weekends (${Math.round(share * 100)}% of days)` });
+      else if (share > 0.40) out.push({ kind: 'weekendBias', dir: 30, mode: 'soft', conf: Math.min(1, share / 0.55), support: n, text: `${first}: weekend-heavy (${Math.round(share * 100)}% of days)` });
+    }
+    /* soft: weekday shape, when meaningfully non-uniform */
+    const shares = dow.map(c => c / n);
+    const active = shares.filter((_, i) => !neverDays.includes(i));
+    const mx = Math.max(...shares) * 7;
+    const mn = (active.length ? Math.min(...active) : 0) * 7;
+    if (n >= 15 && (mx > 1.7 || mn < 0.45)) {
+      const top = shares.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 3).map(x => DOW_NAMES[x[1]]);
+      out.push({ kind: 'dowPattern', share: shares, mode: 'soft', conf: Math.min(1, (mx - 1) / 1.5), support: n, text: `${first}: weekdays skew ${top.join('/')}` });
+    }
+    /* soft: block style (7-on stretches vs scattered singles) */
+    const runs = [];
+    let run = 1;
+    for (let i = 1; i <= list.length; i++) {
+      if (i < list.length && list[i] === addDays(list[i - 1], 1)) run++;
+      else { runs.push(run); run = 1; }
+    }
+    const meanRun = runs.reduce((a, b) => a + b, 0) / runs.length;
+    const modeRun = [...runs.reduce((m, r) => m.set(r, (m.get(r) || 0) + 1), new Map())].sort((a, b) => b[1] - a[1])[0][0];
+    if (modeRun >= 5) out.push({ kind: 'blockStyle', mult: 2, mode: 'soft', conf: Math.min(1, meanRun / 7), support: runs.length, text: `${first}: long stretches (typical block ${modeRun}, avg ${meanRun.toFixed(1)})` });
+    else if (meanRun < 1.5 && runs.length >= 6) out.push({ kind: 'blockStyle', mult: 0.3, mode: 'soft', conf: Math.min(1, 1 - meanRun / 3), support: runs.length, text: `${first}: mostly single days (avg block ${meanRun.toFixed(1)})` });
+    /* position loyalty — SOFT by default even at 100%: coverage outranks zone
+       loyalty (hard zone-locks cratered fill at multi-zone sites), and the
+       scheduler can promote any chip to HARD when it's a true credential line */
+    const pc = [...posCount.get(who).entries()].sort((a, b) => b[1] - a[1]);
+    const totalP = pc.reduce((a, b) => a + b[1], 0);
+    if (pc.length && totalP >= 15) {
+      const [topPos, cnt] = pc[0];
+      const f = cnt / totalP;
+      if (f >= 0.92) out.push({ kind: 'posOnly', pos: topPos, mode: 'soft', conf: f, support: totalP, text: `${first}: only works “${topPos}” (${Math.round(f * 100)}% of ${totalP} shifts)` });
+      else if (f >= 0.6) out.push({ kind: 'posPrefer', pos: topPos, mode: 'soft', conf: f, support: totalP, text: `${first}: mainly “${topPos}” (${Math.round(f * 100)}%)` });
+    }
+    if (out.length) rules[who] = out;
+  }
+  return { window: [minD, maxD], rules };
+}
+
+function ruleKey(who, r) { return who + '|' + r.kind + '|' + (r.pos || (r.days || []).join(',')); }
+
+/* carry the scheduler's hard/soft/off choices from one ruleset onto another */
+function carryRuleModes(from, onto) {
+  if (!from || !from.rules) return onto;
+  const modes = new Map();
+  for (const [who, rs] of Object.entries(from.rules)) for (const r of rs) modes.set(ruleKey(who, r), r.mode);
+  for (const [who, rs] of Object.entries(onto.rules)) for (const r of rs) { const k = ruleKey(who, r); if (modes.has(k)) r.mode = modes.get(k); }
+  return onto;
+}
+
+function runAnalyze() {
+  const mined = carryRuleModes(overlay.analyze, mineHistory());
+  overlay.analyze = { generatedAt: TODAY, ...mined, narration: null };
+  const total = Object.values(mined.rules).reduce((a, b) => a + b.length, 0);
+  audit(`Analyzed ${mined.window[0]} → ${mined.window[1]}: mined ${total} rules for ${Object.keys(mined.rules).length} providers`, 'ai');
+  saveOverlay();
+}
+
+/* flatten active rules into a fast per-provider lookup for the engines */
+function compileMinedRules(an = overlay.analyze) {
+  const map = new Map();
+  if (!an || !an.rules) return map;
+  for (const [who, rs] of Object.entries(an.rules)) {
+    const c = { dowNever: new Set(), dowAvoid: new Set(), weekendNever: false, weekendBias: 0, dowShare: null, blockMult: 1, posOnly: null, posPrefer: null };
+    let any = false;
+    for (const r of rs) {
+      if (r.mode === 'off') continue;
+      any = true;
+      const hard = r.mode === 'hard';
+      if (r.kind === 'dowNever') r.days.forEach(d => (hard ? c.dowNever : c.dowAvoid).add(d));
+      else if (r.kind === 'weekendNever') { if (hard) c.weekendNever = true; else c.weekendBias = -35; }
+      else if (r.kind === 'weekendBias') c.weekendBias = r.dir;
+      else if (r.kind === 'dowPattern') c.dowShare = r.share;
+      else if (r.kind === 'blockStyle') c.blockMult = r.mult;
+      else if (r.kind === 'posOnly') { if (hard) c.posOnly = r.pos; else c.posPrefer = r.pos; }
+      else if (r.kind === 'posPrefer') c.posPrefer = r.pos;
+    }
+    if (any) map.set(who, c);
+  }
+  return map;
+}
+
+/* per-assignment score delta from soft mined rules — shared by both engines */
+function minedScore(m, slot, dow) {
+  let s = 0;
+  if (m.dowAvoid.has(dow)) s -= 35;
+  if (m.weekendBias && (dow === 0 || dow === 6)) s += m.weekendBias;
+  if (m.dowShare) s += Math.max(-35, Math.min(35, Math.round((m.dowShare[dow] * 7 - 1) * 25)));
+  if (m.posPrefer && slot.pos === m.posPrefer) s += 40;
+  return s;
+}
+
+/* hard mined rules → not eligible for this slot */
+function minedBlocks(m, slot, dow) {
+  if (m.dowNever.has(dow)) return true;
+  if (m.weekendNever && (dow === 0 || dow === 6)) return true;
+  if (m.posOnly && slot.pos !== m.posOnly) return true;
+  return false;
+}
+
+/* ---------- backtest: regenerate a real month blind and compare ---------- */
+
+function realMonths() {
+  const set = new Set();
+  for (const s of base) if (!s.forecast) set.add(s.date.slice(0, 7));
+  return [...set].sort();
+}
+
+async function runBacktest(site, mo) {
+  const g = state.gen;
+  g.backtest = { running: true, site, mo };
+  render();
+  try {
+    const real = base.filter(s => !s.forecast && s.who && s.site === site && s.date.startsWith(mo) && slotRole(s.pos) !== 'SKIP');
+    if (real.length < 30) throw new Error(`only ${real.length} real assigned shifts at ${siteName(site)} in ${mo} — pick a bigger site/month`);
+    const slots = real.map(s => ({ ...s, who: '' }));
+    /* roster + targets learned ONLY from the other months (no peeking) */
+    const perWho = new Map();
+    for (const s of base) {
+      if (s.forecast || !s.who || s.site !== site || s.date.startsWith(mo) || slotRole(s.pos) === 'SKIP') continue;
+      if (!perWho.has(s.who)) perWho.set(s.who, { months: new Map(), role: new Map() });
+      const r = perWho.get(s.who);
+      const m = s.date.slice(0, 7);
+      if (!r.months.has(m)) r.months.set(m, new Set());
+      r.months.get(m).add(s.date);
+      const ro = slotRole(s.pos);
+      r.role.set(ro, (r.role.get(ro) || 0) + 1);
+    }
+    const pool = [];
+    for (const [who, r] of perWho) {
+      const counts = [...r.months.values()].map(x => x.size);
+      const avg = counts.reduce((a, b) => a + b, 0) / counts.length;
+      if (avg < 2) continue;
+      const role = ([...r.role.entries()].sort((a, b) => b[1] - a[1])[0] || ['ANY'])[0];
+      pool.push({ who, role: role === 'SKIP' ? 'ANY' : role, target: Math.max(2, Math.round(avg)), avg, fromAvg: true, float: false });
+    }
+    const profiles = new Map();
+    for (const s of base) {
+      if (s.forecast || !s.who || s.date.startsWith(mo)) continue;
+      if (!profiles.has(s.who)) profiles.set(s.who, { total: 0, day: 0, eve: 0, night: 0 });
+      const t = profiles.get(s.who);
+      t.total++;
+      t[shiftBucket(s)]++;
+    }
+    const minedEx = carryRuleModes(overlay.analyze, mineHistory(mo));   // leakage-free, same hard/soft choices
+    const monthShifts = base.filter(s => !s.forecast && s.who && s.date.startsWith(mo) && s.site !== site);
+    const res = await runGenerationSolver(site, mo, {
+      slots, pool, reqs: new Map(), profiles, maxRun: 5, monthShifts,
+      edgeShifts: base.filter(s => !s.forecast && s.who),   // real adjacent-month shifts anchor rotation phase
+      minedMap: overlay.analyze ? compileMinedRules(minedEx) : new Map(),
+    });
+    const realById = new Map(real.map(s => [s.id, s.who]));
+    let match = 0;
+    const genWho = new Map();
+    for (const a of res.assignments) {
+      if (realById.get(a.slot.id) === a.who) match++;
+      genWho.set(a.who, (genWho.get(a.who) || 0) + 1);
+    }
+    const realWho = new Map();
+    for (const s of real) realWho.set(s.who, (realWho.get(s.who) || 0) + 1);
+    const provs = new Set([...genWho.keys(), ...realWho.keys()]);
+    let mae = 0;
+    for (const p of provs) mae += Math.abs((genWho.get(p) || 0) - (realWho.get(p) || 0));
+    mae /= Math.max(1, provs.size);
+    const realDays = new Set(real.map(s => s.who + '|' + s.date));
+    let dayHit = 0;
+    for (const a of res.assignments) if (realDays.has(a.who + '|' + a.slot.date)) dayHit++;
+    g.backtest = {
+      running: false, site, mo, usedRules: !!overlay.analyze,
+      slotMatch: match / real.length, dayMatch: dayHit / real.length,
+      filled: res.assignments.length, slots: real.length, mae, provs: provs.size,
+      engine: res.engine, ms: res.solver && res.solver.ms,
+    };
+    audit(`Backtest ${siteName(site)} ${fmtMonth(mo)}${overlay.analyze ? ' (mined rules on)' : ' (no mined rules)'}: ${Math.round(g.backtest.slotMatch * 100)}% exact-slot match, ${Math.round(g.backtest.dayMatch * 100)}% same-person-same-day, load error ${mae.toFixed(1)} days/provider`, 'ai');
+  } catch (err) {
+    g.backtest = { running: false, site, mo, error: String(err.message || err) };
+  }
+  saveOverlay();
+  render();
+}
+
+/* ---------- Analyze card (Generate view) ---------- */
+
+function renderAnalyzeCard(wrap) {
+  const g = state.gen;
+  const an = overlay.analyze;
+  const box = el('div', 'reqform analyzebox');
+  cardHeader(box, '📊 Learned rules from history', an ? '↻ Re-analyze' : '🔍 Analyze history', () => {
+    runAnalyze();
+    if (g.result) rebuildProposal(g.site, g.month);
+    render();
+  });
+  if (!an) {
+    box.append(el('div', 'reqhint', 'Mines every human-made assignment in the imported W2W history — who works which weekdays, weekend rhythm, block style (7-on vs singles), position loyalty — into hard and soft rules with confidence scores. The optimizer then builds months that look like the ones your schedulers actually build. Nothing changes until you run it, and every rule stays toggleable.'));
+    wrap.append(box);
+    return;
+  }
+  const total = Object.values(an.rules).reduce((a, b) => a + b.length, 0);
+  const counts = { hard: 0, soft: 0, off: 0 };
+  for (const rs of Object.values(an.rules)) for (const r of rs) counts[r.mode] = (counts[r.mode] || 0) + 1;
+  box.append(el('div', 'reqhint', `Mined ${fmtDate(an.window[0])} – ${fmtDate(an.window[1])}: ${total} rules across ${Object.keys(an.rules).length} providers — ${counts.hard} hard · ${counts.soft} soft · ${counts.off} off. HARD = the optimizer may never break it; soft = it pays to follow it. Click a chip to cycle hard → soft → off.`));
+  const poolNames = poolFor(g.site, g.month).map(p => p.who);
+  const shown = poolNames.filter(w => an.rules[w]).sort();
+  if (!shown.length) box.append(el('div', 'reqhint', `No mined rules for the current ${siteName(g.site)} roster (providers need 8+ worked days in the window).`));
+  for (const who of shown) {
+    const row = el('div', 'adjrow analyzerow');
+    row.append(el('span', 'todaylabel', who.replace(/,.*$/, '')));
+    for (const r of an.rules[who]) {
+      const chip = el('button', 'adjchip rulechip mode-' + r.mode,
+        `${r.text.replace(/^[^:]+: /, '')} · ${Math.round(r.conf * 100)}%${r.mode === 'hard' ? ' · HARD' : r.mode === 'off' ? ' · OFF' : ''}`);
+      chip.type = 'button';
+      chip.title = `${r.text}\nconfidence ${Math.round(r.conf * 100)}% · support ${r.support} observations\nClick to cycle: hard → soft → off`;
+      chip.onclick = () => {
+        r.mode = r.mode === 'hard' ? 'soft' : r.mode === 'soft' ? 'off' : 'hard';
+        audit(`Mined rule set to ${r.mode.toUpperCase()}: ${r.text}`, 'ai');
+        saveOverlay();
+        if (g.result) rebuildProposal(g.site, g.month);
+        render();
+      };
+      row.append(chip);
+    }
+    box.append(row);
+  }
+  const others = Object.keys(an.rules).length - shown.length;
+  if (others > 0) box.append(el('div', 'reqhint', `…plus ${others} more providers beyond the ${siteName(g.site)} roster — their rules travel with them wherever they're scheduled.`));
+  if (backendOn()) {
+    const nb = el('button', '', an.narrating ? '✦ Opus is reviewing…' : '✦ Opus, sanity-check these rules');
+    nb.type = 'button';
+    nb.disabled = !!an.narrating;
+    nb.onclick = () => narrateAnalysis();
+    box.append(nb);
+  }
+  if (an.narration) box.append(el('div', 'claudeanalysis', an.narration));
+  /* backtest: the proof the imitation works */
+  const bt = el('div', 'backtestrow');
+  bt.append(el('span', 'todaylabel', '🧪 Backtest'));
+  const moSel = document.createElement('select');
+  for (const m of realMonths()) {
+    const o = el('option', '', fmtMonth(m));
+    o.value = m;
+    if (g.backtest && g.backtest.mo === m) o.selected = true;
+    moSel.append(o);
+  }
+  const runB = el('button', 'primary', `Blind-rebuild a real ${siteName(g.site)} month & compare`);
+  runB.type = 'button';
+  runB.disabled = !!(g.backtest && g.backtest.running);
+  runB.onclick = () => runBacktest(g.site, moSel.value);
+  bt.append(moSel, runB);
+  box.append(bt);
+  const b = g.backtest;
+  if (b) {
+    if (b.running) box.append(el('div', 'reqhint', `Re-staffing ${siteName(b.site)} ${fmtMonth(b.mo)} blind — roster, targets, and rules all learned from the OTHER months only…`));
+    else if (b.error) box.append(el('div', 'conflict', '⚠ ' + b.error));
+    else {
+      const kp = el('div', 'kpirow');
+      kp.append(kpi(`${Math.round(b.dayMatch * 100)}%`, 'Same person, same day as the human schedule', b.dayMatch >= 0.7 ? 'ok' : ''));
+      kp.append(kpi(`${Math.round(b.slotMatch * 100)}%`, 'Exact slot → same person', b.slotMatch >= 0.55 ? 'ok' : ''));
+      kp.append(kpi(b.mae.toFixed(1), 'Load error (days/provider)', b.mae <= 1.5 ? 'ok' : 'warn'));
+      kp.append(kpi(`${b.filled}/${b.slots}`, 'Slots refilled', b.filled === b.slots ? 'ok' : ''));
+      box.append(kp);
+      box.append(el('div', 'reqhint', `${fmtMonth(b.mo)} at ${siteName(b.site)}, rebuilt with no knowledge of that month${b.usedRules ? ' (mined rules ON)' : ' (mined rules OFF — run Analyze and compare)'}: ${Math.round(b.dayMatch * 100)}% of assignments put the same provider on the same day your schedulers chose. Re-run after toggling rules to see what each one buys.`));
+    }
+  }
+  wrap.append(box);
+}
+
+/* one-shot Opus review of the mined rules (statistics in, narration out) */
+async function narrateAnalysis() {
+  const an = overlay.analyze;
+  if (!an || !backendOn() || an.narrating) return;
+  an.narrating = true;
+  render();
+  try {
+    const poolNames = new Set(poolFor(state.gen.site, state.gen.month).map(p => p.who));
+    const lines = [];
+    for (const [who, rs] of Object.entries(an.rules)) {
+      for (const r of rs) lines.push(`${poolNames.has(who) ? '[current roster] ' : ''}${r.text} — confidence ${Math.round(r.conf * 100)}%, support ${r.support}, currently ${r.mode.toUpperCase()}`);
+    }
+    const data = await backendCall('/api/agent', {
+      system: 'You review scheduling rules that were statistically mined from six months of real hospital shift schedules. HARD rules become inviolable constraints in an optimizer; SOFT rules become preferences. Your job: flag rules that look like artifacts of short-staffing or small samples rather than true constraints (suggest softening/off), flag any that look strong enough to promote to HARD, and note anything surprising a scheduler should confirm. Be concise — a short paragraph then a few bullets naming specific providers. No tables.',
+      messages: [{ role: 'user', content: `Rules mined ${an.window[0]} → ${an.window[1]} (${lines.length} total; roster of the site being scheduled is tagged):\n` + lines.slice(0, 160).join('\n') }],
+      tools: [],
+    });
+    an.narration = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    audit('Opus 4.8 reviewed the mined rule set', 'ai');
+  } catch (err) {
+    an.narration = 'Review failed: ' + String(err.message || err);
+  }
+  an.narrating = false;
+  saveOverlay();
+  render();
 }
 
 function applyGeneration(gen) {
@@ -3169,6 +3548,8 @@ function renderGenerate(main) {
     reqBox.append(table);
   }
   wrap.append(reqBox);
+
+  renderAnalyzeCard(wrap);
 
   /* Opus 4.8's plan (when generated through the backend) */
   if (g.claudePlan) {
