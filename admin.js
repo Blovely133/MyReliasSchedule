@@ -3572,9 +3572,10 @@ function unleashMech() {
 
   /* timeline */
   const startMs = performance.now();
-  let lastMs = startMs, nextBoom = 0.05, endAt = 10.2, curT = 0, raf = 0;
+  let lastMs = startMs, nextBoom = 0.05, endAt = 10.2, curT = 0, raf = 0, failsafe = 0;
 
   function teardown() {
+    clearTimeout(failsafe);
     cancelAnimationFrame(raf);
     window.removeEventListener('resize', fit);
     window.removeEventListener('keydown', onKey);
@@ -3584,6 +3585,8 @@ function unleashMech() {
     if (btn) { btn.disabled = false; btn.textContent = "Don't Click"; btn.title = 'You know exactly what happens.'; }
     mechShowRunning = false;
   }
+  /* rAF pauses in hidden tabs — make sure the show always strikes its own set */
+  failsafe = setTimeout(teardown, 14000);
   function onKey(e) { if (e.key === 'Escape') endAt = Math.min(endAt, curT + 0.3); }
   window.addEventListener('keydown', onKey);
   cv.addEventListener('click', () => { endAt = Math.min(endAt, curT + 0.3); });
