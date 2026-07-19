@@ -455,6 +455,8 @@ table.reqcal td.cell-off { background: color-mix(in srgb, #cf2e2e 24%, var(--pan
   color: var(--ink);
 }
 .rulenum { width: 68px; }
+td.underfloor { color: #ff7b7b; font-weight: 700; }
+.underfloor-tag { font-size: 10.5px; font-weight: 700; color: #ff7b7b; white-space: nowrap; }
 
 @media (max-width: 900px) {
   .publishbar { position: static; flex-wrap: wrap; }

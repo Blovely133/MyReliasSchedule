@@ -174,6 +174,9 @@ async function unlockData() {
     error.textContent = '';
     try {
       await loadData(pin);
+      /* fresh chat each login — the conversation log shouldn't persist between
+         sessions (adjustment chips DO persist; they're real schedule changes) */
+      if (overlay.genChat.length) { overlay.genChat = []; saveOverlay(); }
       $('#accessGate').remove();
       document.body.classList.remove('access-locked');
       return;
@@ -1560,6 +1563,10 @@ function runGeneration(site, mo) {
       else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
       let score = 0;
       if (!st.tod && st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
+      /* floor rule: nobody ends the month below their average minus one — a
+         provider still under floor outbids every other consideration */
+      const floor = Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
+      if (st.dates.size < floor) score += 400 + (floor - st.dates.size) * 10;
       if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
       if (st.dates.has(addDays(slot.date, -1))) score += 45;                     // build blocks
       score += p.float ? -8 : 12;                                                // regulars first
@@ -1585,11 +1592,15 @@ function runGeneration(site, mo) {
       bestRun = Math.max(bestRun, len);
     }
     st.longestRun = bestRun;
+    const r = reqs.get(st.who);
+    st.floor = Math.max(0, Math.min(st.target - 1, (r && r.cap) || Infinity));
+    st.underFloor = st.dates.size < st.floor;
   }
+  const underFloor = [...stats.values()].filter(st => st.underFloor).map(st => st.who);
   const offDays = [...reqs.values()].reduce((a, r) => a + r.off.size, 0);
   const preferTotal = [...reqs.values()].reduce((a, r) => a + r.prefer.size, 0);
   const preferGot = [...stats.values()].reduce((a, s) => a + s.preferGot, 0);
-  return { site, mo, slots: slots.length, skipped, assignments, unfilled, stats, reqs, offDays, preferTotal, preferGot, capsHit: [...capsHit], maxRun };
+  return { site, mo, slots: slots.length, skipped, assignments, unfilled, stats, reqs, offDays, preferTotal, preferGot, capsHit: [...capsHit], maxRun, underFloor };
 }
 
 function applyGeneration(gen) {
@@ -2690,6 +2701,9 @@ function renderGenerate(main) {
     bullet(`Every requested day off was honored — the engine treats “unavailable” as a hard rule, never a suggestion.`);
     if (res.preferTotal) bullet(`${res.preferGot} of ${res.preferTotal} preferred days granted; the misses lost out to load balancing or one-shift-per-day.`);
     if (res.capsHit.length) bullet(`Shift caps held: ${res.capsHit.map(n => n.replace(/,.*$/, '')).join(', ')} stopped at their requested maximums.`);
+    bullet(res.underFloor.length
+      ? `⚠ Below their normal load (average − 1): ${res.underFloor.map(n => n.replace(/,.*$/, '')).join(', ')} — their days off, time-of-day pattern, or the open-shift mix left too few eligible shifts. Consider freeing shifts for them.`
+      : `Everyone gets at least their average minus one — nobody's month falls below their normal load.`);
     const runners = [...res.stats.values()].filter(s => s.longestRun >= 3).sort((a, b) => b.longestRun - a.longestRun).slice(0, 2);
     for (const r of runners) bullet(`Block scheduling: ${r.who.replace(/,.*$/, '')} works up to ${r.longestRun} consecutive days rather than scattered singles.`);
     bullet(`At least 10 hours off between shifts — no mid-to-morning (e.g. 11:00–23:00 then a 06:00 start) and no night-to-day flips — and no stretches over ${res.maxRun} days, by rule.`);
@@ -2707,14 +2721,16 @@ function renderGenerate(main) {
     const ptb = el('tbody');
     let anyPlanned = false;
     const rfNow = state.gen.roleFilter;
-    for (const s of [...res.stats.values()].filter(s => s.assigned && (!rfNow || s.role === rfNow || s.role === 'ANY')).sort((a, b) => b.assigned - a.assigned)) {
+    for (const s of [...res.stats.values()].filter(s => (s.assigned || s.underFloor) && (!rfNow || s.role === rfNow || s.role === 'ANY')).sort((a, b) => b.assigned - a.assigned)) {
       const tr = el('tr');
       const tdN = el('td', '', s.who);
       if (s.float) tdN.append(el('span', 'floatpill', 'float'));
       tr.append(tdN);
       tr.append(el('td', '', s.role));
       tr.append(el('td', '', s.tod ? ({ night: 'nights', day: 'days', eve: 'evenings' }[s.tod] + ' (rule)') : usualShift(s.prof)));
-      tr.append(el('td', '', String(s.assigned)));
+      const tdA = el('td', s.underFloor ? 'underfloor' : '', String(s.assigned));
+      if (s.underFloor) { tdA.append(el('span', 'underfloor-tag', ` ⚠ below avg−1 (${s.dates.size}/${s.floor})`)); }
+      tr.append(tdA);
       if (s.fromClaude) {
         tr.append(el('td', '', `${s.target} (Opus)`));
       } else if (s.fromAvg) {
