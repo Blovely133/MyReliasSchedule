@@ -15,6 +15,8 @@ const EMPTY_OVERLAY = () => ({
   requests: [], contacts: {}, messages: [], trades: [], prefs: {}, notifs: [], reqSubmissions: [],
   adminDraft: { edits: {}, added: [], removed: [] },
   audit: [],
+  genAdjust: [],   // structured ops from the "talk to the schedule" box
+  genChat: [],     // its conversation log
 });
 
 let base = [];          // [{id,date,pos,start,end,who,site,note}]
@@ -101,6 +103,8 @@ function readOverlayFromStorage() {
   for (const k of ['edits']) if (!overlay.adminDraft[k]) overlay.adminDraft[k] = {};
   for (const k of ['added', 'removed']) if (!overlay.adminDraft[k]) overlay.adminDraft[k] = [];
   if (!overlay.audit) overlay.audit = [];
+  if (!overlay.genAdjust) overlay.genAdjust = [];
+  if (!overlay.genChat) overlay.genChat = [];
 }
 
 async function loadData(pin) {
@@ -1211,7 +1215,30 @@ function fmtDayRanges(mo, set) {
   return parts.join(', ');
 }
 
-/* example requests + anything staff submitted in-app, merged per provider */
+/* ops recorded by the "talk to the schedule" assistant, scoped to a site */
+function genAdjustFor(site) {
+  return (overlay.genAdjust || []).filter(a => a.site === site || a.site === '*');
+}
+
+function applyPoolAdjust(pool, site) {
+  let out = pool.map(p => ({ ...p }));
+  for (const a of genAdjustFor(site)) {
+    if (a.kind === 'addProvider') {
+      if (!out.some(p => p.who === a.who)) out.push({ who: a.who, role: a.role, target: a.target, avg: 0, fromAvg: false, float: false, tod: a.tod || null });
+    } else if (a.kind === 'removeProvider') {
+      out = out.filter(p => p.who !== a.who);
+    } else if (a.kind === 'setTarget') {
+      const p = out.find(x => x.who === a.who);
+      if (p) { p.target = a.value; p.fromAvg = false; }
+    } else if (a.kind === 'setTimeOfDay') {
+      const p = out.find(x => x.who === a.who);
+      if (p) p.tod = a.tod;
+    }
+  }
+  return out;
+}
+
+/* example requests + anything staff submitted in-app + assistant ops, merged per provider */
 function requestsFor(site, mo) {
   const map = new Map();
   const ensure = who => {
@@ -1236,6 +1263,21 @@ function requestsFor(site, mo) {
     const e = ensure(name);
     for (const iso of off) e.off.add(iso);
     for (const iso of like) e.prefer.add(iso);
+  }
+  for (const a of genAdjustFor(site)) {
+    if (a.kind === 'addOff') {
+      const e = ensure(a.who);
+      for (const d of a.dates) e.off.add(d);
+      if (e.source === 'submitted') e.source = 'assistant';
+    } else if (a.kind === 'addPrefer') {
+      const e = ensure(a.who);
+      for (const d of a.dates) e.prefer.add(d);
+      if (e.source === 'submitted') e.source = 'assistant';
+    } else if (a.kind === 'setCap') {
+      const e = ensure(a.who);
+      e.cap = a.value;
+      if (e.source === 'submitted') e.source = 'assistant';
+    }
   }
   return map;
 }
@@ -1265,18 +1307,18 @@ function poolFor(site, mo) {
   const avg = siteAvgDays(site);
   const ex = EXAMPLE_SCHEDULING[site];
   if (ex && ex.month === mo) {
-    return ex.pool.map(([who, role, seeded, float]) => {
+    return applyPoolAdjust(ex.pool.map(([who, role, seeded, float]) => {
       const h = avg.get(who);
       /* floats keep their small caps; regulars target their own recent average
          when it's a credible signal (2+ months, 4+ days/mo) — otherwise the
          planned roster number stands in for missing/stray W2W history */
       const useAvg = !float && !!h && h.months >= 2 && h.avg >= 4;
       return { who, role, target: useAvg ? Math.round(h.avg) : seeded, avg: h ? h.avg : 0, fromAvg: useAvg, float: !!float };
-    });
+    }), site);
   }
-  return [...avg.entries()]
+  return applyPoolAdjust([...avg.entries()]
     .filter(([, h]) => h.avg >= 1)
-    .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false }));
+    .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false })), site);
 }
 
 function runGeneration(site, mo) {
@@ -1288,6 +1330,7 @@ function runGeneration(site, mo) {
   const pool = poolFor(site, mo);
   const reqs = requestsFor(site, mo);
   const profiles = timeProfiles();
+  const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
   const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), prof: profiles.get(p.who) || null }]));
   const overnights = new Map();
   const markOvernight = (who, date) => {
@@ -1316,12 +1359,13 @@ function runGeneration(site, mo) {
       if (st.dates.has(slot.date)) continue;                                     // hard: one shift/day
       if (slot.start < '12:00' && overnights.get(p.who)?.has(addDays(slot.date, -1))) continue;  // hard: rest after overnight
       let run = 0;
-      for (let k = 1; k <= 5; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
-      if (run >= 5) continue;                                                    // hard: max 5 consecutive days
+      for (let k = 1; k <= maxRun; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
+      if (run >= maxRun) continue;                                               // hard: max consecutive days (assistant-tunable, default 5)
       const bucket = shiftBucket(slot);
-      if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
+      if (st.tod) { if (bucket !== st.tod) continue; }                           // hard: assistant rule ("nights only")
+      else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
       let score = 0;
-      if (st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
+      if (!st.tod && st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
       if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
       if (st.dates.has(addDays(slot.date, -1))) score += 45;                     // build blocks
       score += p.float ? -8 : 12;                                                // regulars first
@@ -1351,7 +1395,7 @@ function runGeneration(site, mo) {
   const offDays = [...reqs.values()].reduce((a, r) => a + r.off.size, 0);
   const preferTotal = [...reqs.values()].reduce((a, r) => a + r.prefer.size, 0);
   const preferGot = [...stats.values()].reduce((a, s) => a + s.preferGot, 0);
-  return { site, mo, slots: slots.length, skipped, assignments, unfilled, stats, reqs, offDays, preferTotal, preferGot, capsHit: [...capsHit] };
+  return { site, mo, slots: slots.length, skipped, assignments, unfilled, stats, reqs, offDays, preferTotal, preferGot, capsHit: [...capsHit], maxRun };
 }
 
 function applyGeneration(gen) {
@@ -1432,6 +1476,256 @@ function collectEmail(site, mo) {
     subject: `${fmtMonth(mo)} scheduling requests — reply by the 15th`,
     body: `Hi Dr. —,\n\nWe're building the ${fmtMonth(mo)} schedule for ${siteName(site)}. Reply to this email with your requests, or tap your dates in MyReliasSchedule → Requests:\n\n  • Days you can't work\n  • Days you'd prefer to work\n  • A shift-count target, if any\n\nEverything received by the 15th is guaranteed consideration. Replies are read automatically and added to your request file.\n\n— Relias Scheduling (drafted by AI, reviewed by your scheduler)`,
   };
+}
+
+/* ---------- "talk to the schedule" assistant ----------
+   Free-typed commands become structured ops (overlay.genAdjust) the generator
+   consumes. Parsing is a built-in intent matcher in this prototype; production
+   swaps it for a Claude API call emitting the same op schema. */
+
+function knownPeople() {
+  const set = new Set(base.filter(s => s.who).map(s => s.who));
+  for (const a of overlay.genAdjust || []) if (a.kind === 'addProvider') set.add(a.who);
+  return [...set];
+}
+
+function findPerson(text) {
+  const t = text.toLowerCase();
+  let best = null;
+  for (const name of knownPeople()) {
+    const clean = name.replace(/,.*$/, '').toLowerCase();
+    if (t.includes(clean) && (!best || clean.length > best.len)) best = { name, len: clean.length };
+  }
+  if (best) return best.name;
+  const tokens = new Set(t.match(/[a-z]{3,}/g) || []);
+  const matches = new Set();
+  for (const name of knownPeople()) {
+    const last = name.replace(/,.*$/, '').split(' ').pop().toLowerCase();
+    if (tokens.has(last)) matches.add(name);
+  }
+  return matches.size === 1 ? [...matches][0] : null;
+}
+
+const STOPCAPS = /^(Sept?|September|Octo?b?e?r?|Nove?m?b?e?r?|Dece?m?b?e?r?|Jan\w*|Feb\w*|Mar\w*|Apr\w*|May|Jun\w*|Jul\w*|Aug\w*|Add|New|Hire|Take|Move|Give|Cap|Limit|Nights?|Days?|Evenings?|Only|About|Per|Month|Shifts?|Physician|Doctor|Provider|Nurse|Starting|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Zone|The|She|He|They|We|Our|His|Her|Their)$/i;
+function extractNewName(original) {
+  for (const m of original.matchAll(/\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b/g)) {
+    if (STOPCAPS.test(m[1]) || STOPCAPS.test(m[2])) continue;
+    return `${m[1]} ${m[2]}`;
+  }
+  return null;
+}
+
+function parseDates(text, defaultMo) {
+  let mo = defaultMo;
+  const t = text.toLowerCase();
+  const MONTHS = { september: '2026-09', sept: '2026-09', sep: '2026-09', october: '2026-10', oct: '2026-10', november: '2026-11', nov: '2026-11', december: '2026-12', dec: '2026-12', august: '2026-08', aug: '2026-08', july: '2026-07', jul: '2026-07' };
+  for (const [k, v] of Object.entries(MONTHS)) if (new RegExp('\\b' + k + '\\b').test(t)) { mo = v; break; }
+  const [y, m] = mo.split('-').map(Number);
+  const daysIn = new Date(y, m, 0).getDate();
+  const dow = d => new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  const days = new Set();
+  if (/\bweekends?\b/.test(t)) for (let d = 1; d <= daysIn; d++) { if (dow(d) === 0 || dow(d) === 6) days.add(d); }
+  ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'].forEach((nm, i) => {
+    if (new RegExp('\\b' + nm + 's?\\b').test(t)) for (let d = 1; d <= daysIn; d++) if (dow(d) === i) days.add(d);
+  });
+  if (/\b(first|1st) week\b/.test(t)) for (let d = 1; d <= 7; d++) days.add(d);
+  if (/\blast week\b/.test(t)) for (let d = daysIn - 6; d <= daysIn; d++) days.add(d);
+  /* strip counts ("12 shifts", "4 in a row") so they don't read as dates */
+  let t2 = t.replace(/\b\d{1,2}\s*(shifts?\b|days?\s*(a|per)\s*month|per month|\/mo\b|(days?\s*)?(in a row|consecutive|straight))/g, ' ');
+  const RANGE = /\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:-|–|—|to|through|thru)\s*(\d{1,2})(?:st|nd|rd|th)?\b/g;
+  for (const r of t2.matchAll(RANGE)) {
+    const a = +r[1], b = +r[2];
+    if (a >= 1 && b >= a && b <= 31) for (let d = a; d <= b; d++) days.add(d);
+  }
+  t2 = t2.replace(RANGE, ' ');
+  for (const s of t2.matchAll(/\b(\d{1,2})(?:st|nd|rd|th)?\b/g)) { const d = +s[1]; if (d >= 1 && d <= 31) days.add(d); }
+  return { mo, dates: [...days].filter(d => d <= daysIn).sort((a, b) => a - b).map(d => `${mo}-${String(d).padStart(2, '0')}`) };
+}
+
+const todOf = t =>
+  /\bnights?\b|overnights?\b|nocturnist/.test(t) ? 'night'
+    : /\bdays?\s+(only|shifts?)\b|\bday shift|\bonly days?\b/.test(t) ? 'day'
+      : /\bevenings?\b|\bswing\b/.test(t) ? 'eve' : null;
+
+let chatSeq = 0;
+function pushChat(from, text) {
+  overlay.genChat.push({ id: 'c' + Date.now() + '-' + (chatSeq++), from, text, created: TODAY });
+  if (overlay.genChat.length > 60) overlay.genChat = overlay.genChat.slice(-60);
+}
+
+let adjSeq = 0;
+function addAdjust(kind, data, summary, site) {
+  overlay.genAdjust.push({ id: 'j' + Date.now() + '-' + (adjSeq++), site: site || state.gen.site, kind, summary, created: TODAY, ...data });
+}
+
+function handleCommand(raw) {
+  const g = state.gen;
+  const text = raw.trim();
+  const t = text.toLowerCase();
+  const firstName = n => n.replace(/,.*$/, '');
+  let changed = false;
+  let reply = '';
+
+  const person = findPerson(text);
+  const { mo, dates } = parseDates(text, g.month);
+  const tod = todOf(t);
+  const numAfter = re => { const m = t.match(re); return m ? +m[1] : null; };
+
+  /* move an assignment inside the current proposal */
+  if (/\b(move|reassign|switch)\b/.test(t) && / to /i.test(text)) {
+    if (!g.result) return { reply: 'Generate a schedule first — then I can move assignments around inside the proposal.', changed: false };
+    const [left, right] = text.split(/ to /i);
+    const fromWho = findPerson(left);
+    const toWho = findPerson(right);
+    const date = parseDates(left.replace(/shifts?/gi, ' '), g.month).dates[0];
+    if (!fromWho || !toWho || !date) return { reply: 'I couldn\'t parse that move. Try: "Move Blake Lovely\'s Sep 14 shift to Jimmy Tu".', changed: false };
+    const a = g.result.assignments.find(x => x.who === fromWho && x.slot.date === date);
+    if (!a) return { reply: `${firstName(fromWho)} has no proposed shift on ${fmtDate(date)}.`, changed: false };
+    const warns = [];
+    if (g.result.assignments.some(x => x.who === toWho && x.slot.date === date)) warns.push(`${firstName(toWho)} already works that day`);
+    const req = g.result.reqs.get(toWho);
+    if (req && req.off.has(date)) warns.push(`${firstName(toWho)} marked ${fmtDate(date)} unavailable`);
+    const need = slotRole(a.slot.pos);
+    const toRole = providerRole({ pos: '', who: toWho });
+    if (need !== 'ANY' && toRole && toRole !== need) warns.push(`role mismatch — ${need} slot, ${toRole} provider`);
+    const fromSt = g.result.stats.get(fromWho);
+    if (fromSt) { fromSt.assigned--; fromSt.dates.delete(date); }
+    let toSt = g.result.stats.get(toWho);
+    if (!toSt) {
+      toSt = { who: toWho, role: toRole || 'ANY', target: 0, avg: 0, fromAvg: false, float: false, assigned: 0, preferGot: 0, dates: new Set(), prof: timeProfiles().get(toWho) || null, longestRun: 0, tod: null };
+      g.result.stats.set(toWho, toSt);
+    }
+    toSt.assigned++; toSt.dates.add(date);
+    a.who = toWho;
+    a.preferred = !!(req && req.prefer.has(date));
+    audit(`Assistant: moved ${fmtDate(date)} ${a.slot.start}–${a.slot.end} ${a.slot.pos} from ${fromWho} to ${toWho}`, 'ai');
+    return { reply: `Done — ${fmtDate(date)} ${a.slot.start}–${a.slot.end} moved from ${firstName(fromWho)} to ${firstName(toWho)}.${warns.length ? ` ⚠ Heads up: ${warns.join('; ')}.` : ''} (Moves live inside this proposal — regenerating rebuilds from scratch.)`, changed: false };
+  }
+
+  if (person && /\b(remove|drop|no longer|resigned?|quit|retir\w*|is leaving|off the schedule)\b/.test(t) && !dates.length) {
+    addAdjust('removeProvider', { who: person }, `${firstName(person)} removed`);
+    audit(`Assistant: removed ${person} from the ${siteName(g.site)} generation pool`, 'ai');
+    reply = `Removed ${person} from the ${siteName(g.site)} pool — the generator won't schedule them.`;
+    changed = true;
+  } else if (person && dates.length && /\b(off|out|unavailable|vacation|pto|can'?t|cannot)\b/.test(t) && !/\b(add|hire|onboard)\b/.test(t)) {
+    addAdjust('addOff', { who: person, dates }, `${firstName(person)} off ${moShort(mo)} ${fmtDayRanges(mo, new Set(dates))}`);
+    audit(`Assistant: marked ${person} unavailable ${moShort(mo)} ${fmtDayRanges(mo, new Set(dates))}`, 'ai');
+    reply = `Got it — ${firstName(person)} is unavailable ${moShort(mo)} ${fmtDayRanges(mo, new Set(dates))}. That's a hard rule.`;
+    changed = true;
+  } else if (person && dates.length && /\b(prefers?|wants? to work|would like|likes? to work)\b/.test(t)) {
+    addAdjust('addPrefer', { who: person, dates }, `${firstName(person)} prefers ${moShort(mo)} ${fmtDayRanges(mo, new Set(dates))}`);
+    audit(`Assistant: noted ${person} prefers ${moShort(mo)} ${fmtDayRanges(mo, new Set(dates))}`, 'ai');
+    reply = `Noted — ${firstName(person)} prefers ${moShort(mo)} ${fmtDayRanges(mo, new Set(dates))}; the generator will chase those days.`;
+    changed = true;
+  } else if (/\b(add|hire|onboard|bring(ing)? (in|on)|joining|new (provider|physician|doctor|apc|np|pa)|starts? (with us|in))\b/.test(t)) {
+    const isNew = !person;
+    let name = person || extractNewName(text);
+    if (!name) return { reply: 'Who should I add? Try: "Add a new physician, Dr. Sarah Chen, nights only, 12 shifts a month".', changed: false };
+    const role = /\bapc\b|\bnp\b|\bpa\b|nurse practitioner|midlevel/.test(t) ? 'APC' : 'PHY';
+    if (isNew && !/,/.test(name)) name = name + (role === 'PHY' ? ', MD' : ', NP');
+    const target = numAfter(/(\d{1,2})\s*(?:shifts?|days?)(?:\s*(?:a|per)\s*month)?/) || 12;
+    addAdjust('addProvider', { who: name, role, target, tod }, `${firstName(name)} added (${role}, ${target}/mo${tod ? ', ' + tod + 's' : ''})`);
+    audit(`Assistant: added ${name} to the ${siteName(g.site)} pool — ${role}, target ${target}/mo${tod ? ', ' + tod + ' shifts only' : ''}`, 'ai');
+    reply = `Added ${name} to the ${siteName(g.site)} pool — ${role === 'PHY' ? 'physician' : 'APC'}, target ${target} shifts/month${tod ? `, ${tod === 'eve' ? 'evening' : tod} shifts only` : ''}${isNew ? '.' : ' (recognized from the existing roster).'}`;
+    changed = true;
+  } else if (person && tod && /\b(only|switch\w*|moves? to|going|works?|is)\b/.test(t)) {
+    addAdjust('setTimeOfDay', { who: person, tod }, `${firstName(person)} → ${tod}s only`);
+    audit(`Assistant: restricted ${person} to ${tod} shifts`, 'ai');
+    reply = `Done — ${firstName(person)} now gets ${tod === 'eve' ? 'evening' : tod} shifts only. Hard rule; overrides their history.`;
+    changed = true;
+  } else if (/\b(no more than|at most|max\w*|cap|limit)\b/.test(t) && /\b(in a row|consecutive|straight)\b/.test(t)) {
+    const n = numAfter(/(\d{1,2})\s*(?:days?|shifts?)?\s*(?:in a row|consecutive|straight)/) || numAfter(/(?:no more than|at most|max\w*|cap|limit)\D{0,12}(\d{1,2})/);
+    if (!n) return { reply: 'How many in a row? Try: "No more than 4 days in a row".', changed: false };
+    addAdjust('maxRun', { value: n }, `max ${n} in a row (all sites)`, '*');
+    audit(`Assistant: global rule — no more than ${n} consecutive days`, 'ai');
+    reply = `Rule set — nobody gets more than ${n} days in a row. Applies to every site's generation.`;
+    changed = true;
+  } else if (person && /\b(no more than|at most|max\w*|cap|limit)\b/.test(t)) {
+    const n = numAfter(/\bat\s+(\d{1,2})\b/) || numAfter(/(?:no more than|at most|max\w*|cap|limit)\D{0,40}(\d{1,2})/);
+    if (!n) return { reply: `What's the cap for ${firstName(person)}? Try: "Cap ${firstName(person)} at 10 shifts".`, changed: false };
+    addAdjust('setCap', { who: person, value: n }, `${firstName(person)} capped at ${n}`);
+    audit(`Assistant: capped ${person} at ${n} shifts`, 'ai');
+    reply = `Capped — ${firstName(person)} won't be scheduled past ${n} shifts.`;
+    changed = true;
+  } else if (person && numAfter(/(\d{1,2})\s*(?:shifts?|days?)\b/) && /\b(target|should|schedule|give|gets?|aim)\b/.test(t)) {
+    const n = numAfter(/(\d{1,2})\s*(?:shifts?|days?)\b/);
+    addAdjust('setTarget', { who: person, value: n }, `${firstName(person)} target ${n}/mo`);
+    audit(`Assistant: set ${person}'s target to ${n}/mo`, 'ai');
+    reply = `Target updated — the generator now aims ${firstName(person)} at ${n} shifts/month.`;
+    changed = true;
+  } else {
+    return {
+      reply: 'I can handle things like:\n• "Add a new physician, Dr. Sarah Chen, nights only, 12 shifts a month"\n• "Take Cole Young off the schedule"\n• "Jimmy Tu is unavailable Sep 8–12"  ·  "Kristin Mitchell prefers the last week"\n• "Cap Renee Mitchell at 10 shifts"  ·  "No more than 4 days in a row"\n• "Emily Stuart works days only"\n• After generating: "Move Blake Lovely\'s Sep 14 shift to Jimmy Tu"',
+      changed: false,
+    };
+  }
+
+  if (changed && g.result) {
+    g.result = runGeneration(g.site, g.month);
+    g.applied = false;
+    reply += ` Regenerated: ${g.result.assignments.length} of ${g.result.slots} slots filled.`;
+  } else if (changed) {
+    reply += ' It\'ll apply the next time you generate.';
+  }
+  return { reply, changed };
+}
+
+function renderScheduleChat(wrap) {
+  const g = state.gen;
+  const box = el('div', 'reqform genchat');
+  box.append(el('h2', '', '💬 Talk to the schedule'));
+  box.append(el('div', 'reqhint', 'Free-type roster and rule changes — new providers, removals, days off, caps, "nights only", or moves after generating. This prototype parses commands in-browser; production routes the same box through Claude\'s API.'));
+  const log = el('div', 'chatlog');
+  const msgs = overlay.genChat || [];
+  if (!msgs.length) {
+    log.append(el('div', 'chatmsg ai', 'Hi! Tell me about roster or rule changes in plain English — e.g. "We have a new physician, Dr. Sarah Chen, starting in September — nights only, about 12 shifts a month."'));
+  }
+  for (const m of msgs.slice(-20)) log.append(el('div', 'chatmsg ' + (m.from === 'you' ? 'you' : 'ai'), m.text));
+  box.append(log);
+  const form = el('form', 'chatform');
+  const inp = el('input');
+  inp.placeholder = 'e.g. "Take Cole Young off the schedule" or "No more than 4 days in a row"';
+  inp.autocomplete = 'off';
+  const send = el('button', 'primary', 'Send');
+  send.type = 'submit';
+  form.append(inp, send);
+  form.onsubmit = e => {
+    e.preventDefault();
+    const text = inp.value.trim();
+    if (!text) return;
+    pushChat('you', text);
+    pushChat('ai', handleCommand(text).reply);
+    g.chatFocus = true;
+    saveOverlay();
+    render();
+  };
+  box.append(form);
+  const active = (overlay.genAdjust || []).filter(a => a.site === g.site || a.site === '*');
+  if (active.length) {
+    const chips = el('div', 'adjrow');
+    chips.append(el('span', 'todaylabel', 'Active changes'));
+    for (const a of active.slice(-10)) {
+      const chip = el('span', 'adjchip', a.summary);
+      const x = el('button', 'adjx', '✕');
+      x.type = 'button';
+      x.title = 'Undo this change';
+      x.onclick = () => {
+        overlay.genAdjust = overlay.genAdjust.filter(z => z.id !== a.id);
+        if (g.result) { g.result = runGeneration(g.site, g.month); g.applied = false; }
+        pushChat('ai', `Undid: ${a.summary}.`);
+        saveOverlay();
+        render();
+      };
+      chip.append(x);
+      chips.append(chip);
+    }
+    box.append(chips);
+  }
+  wrap.append(box);
+  requestAnimationFrame(() => {
+    log.scrollTop = log.scrollHeight;
+    if (g.chatFocus) { g.chatFocus = false; inp.focus(); }
+  });
 }
 
 /* ---------- generate view ---------- */
@@ -1523,6 +1817,8 @@ function renderGenerate(main) {
   intro.append(el('div', 'reqhint',
     'Collect requests → reconcile → draft → publish. The reconciliation engine runs live in this browser — days off are never violated, caps and rest rules hold, blocks stay together, night people stay on nights (time-of-day is learned from each provider\'s history), and each provider is targeted at their own average days worked over the last three months. In production the same loop runs through Claude\'s API, including emailing providers to collect requests and sending everyone their schedule.'));
   wrap.append(intro);
+
+  renderScheduleChat(wrap);
 
   /* controls */
   const ctrl = el('div', 'reqform');
@@ -1621,7 +1917,7 @@ function renderGenerate(main) {
     if (res.capsHit.length) bullet(`Shift caps held: ${res.capsHit.map(n => n.replace(/,.*$/, '')).join(', ')} stopped at their requested maximums.`);
     const runners = [...res.stats.values()].filter(s => s.longestRun >= 3).sort((a, b) => b.longestRun - a.longestRun).slice(0, 2);
     for (const r of runners) bullet(`Block scheduling: ${r.who.replace(/,.*$/, '')} works up to ${r.longestRun} consecutive days rather than scattered singles.`);
-    bullet('No overnight-into-morning turnarounds and no stretches over 5 days, by rule.');
+    bullet(`No overnight-into-morning turnarounds and no stretches over ${res.maxRun} days, by rule.`);
     for (const r of [...res.reqs.values()].filter(r => r.note && !r.off.size && !r.prefer.size && !r.cap)) {
       bullet(`Noted but not auto-enforced: ${r.who.replace(/,.*$/, '')} — “${r.note}”.`);
     }
@@ -1641,7 +1937,7 @@ function renderGenerate(main) {
       if (s.float) tdN.append(el('span', 'floatpill', 'float'));
       tr.append(tdN);
       tr.append(el('td', '', s.role));
-      tr.append(el('td', '', usualShift(s.prof)));
+      tr.append(el('td', '', s.tod ? ({ night: 'nights', day: 'days', eve: 'evenings' }[s.tod] + ' (rule)') : usualShift(s.prof)));
       tr.append(el('td', '', String(s.assigned)));
       if (s.fromAvg) {
         tr.append(el('td', '', `${s.target} (avg ${s.avg.toFixed(1)})`));
