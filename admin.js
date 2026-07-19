@@ -2492,8 +2492,17 @@ async function runAdversarialReview() {
         audit(`Adversarial review round ${round}: clean — no flags`, 'ai');
         break;
       }
-      /* apply fixes: pool-level ops force a regeneration, then moves patch the fresh proposal */
-      const fixes = data.fixes || [];
+      /* apply fixes: pool-level ops force a regeneration, then moves patch the fresh proposal.
+         REJECT any fix that would cut a provider's target/cap below their current
+         target − 1 — the reviewer fixing an overload by lowballing someone else
+         is exactly how people ended up 3 shifts under their average. */
+      const baseline = new Map(poolFor(g.site, g.month).map(p => [p.who, p.target]));
+      const lowers = f => (f.kind === 'setCap' || f.kind === 'setTarget') && f.who && f.value != null &&
+        baseline.has(f.who) && f.value < Math.max(0, baseline.get(f.who) - 1);
+      const rejected = (data.fixes || []).filter(lowers);
+      const fixes = (data.fixes || []).filter(f => !lowers(f));
+      entry.rejected = rejected.length;
+      if (rejected.length) audit(`Adversarial review round ${round}: rejected ${rejected.length} fix${rejected.length === 1 ? '' : 'es'} that would cut providers below their average (${rejected.map(f => `${f.who.replace(/,.*$/, '')}→${f.value}`).join(', ')})`, 'ai');
       const moves = fixes.filter(f => f.kind === 'move');
       const poolOps = fixes.filter(f => f.kind !== 'move');
       let applied = 0;
@@ -2851,7 +2860,7 @@ function renderGenerate(main) {
       if (g.review.error) rev.append(el('div', 'reqhint', g.review.error));
       for (const rd of g.review.rounds) {
         const rbox = el('div', 'reviewround' + (rd.clean ? ' clean' : ''));
-        rbox.append(el('b', '', `Round ${rd.round}: ${rd.clean ? '✓ no flags — schedule holds up' : `${rd.flags.length} flag${rd.flags.length === 1 ? '' : 's'}, ${rd.fixesApplied} fix${rd.fixesApplied === 1 ? '' : 'es'} applied`}`));
+        rbox.append(el('b', '', `Round ${rd.round}: ${rd.clean ? '✓ no flags — schedule holds up' : `${rd.flags.length} flag${rd.flags.length === 1 ? '' : 's'}, ${rd.fixesApplied} fix${rd.fixesApplied === 1 ? '' : 'es'} applied${rd.rejected ? ` · ${rd.rejected} rejected (would cut someone below their average)` : ''}`}`));
         if (rd.summary) rbox.append(el('div', 'reqhint', rd.summary));
         for (const f of rd.flags) {
           const li = el('div', 'reviewflag sev-' + f.severity);
