@@ -177,7 +177,11 @@ async function handleGenerate(env, payload) {
     maxTokens: 2048,
     effort: 'medium',
   });
-  return { analysis: input.analysis, notes: input.notes || [], targets: input.targets || [], usage };
+  const notes = Array.isArray(input.notes)
+    ? input.notes
+    : (input.notes ? String(input.notes).split('\n').map(s => s.replace(/^[-•*]\s*/, '').trim()).filter(Boolean) : []);
+  const targets = Array.isArray(input.targets) ? input.targets : [];
+  return { analysis: input.analysis || '', notes, targets, usage };
 }
 
 /* ---- router ---- */

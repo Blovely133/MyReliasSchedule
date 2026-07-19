@@ -2481,9 +2481,10 @@ function renderGenerate(main) {
       cp.append(el('div', 'reqhint', 'Fell back to the built-in engine below — the proposal is still valid. Check the Worker URL/key via 🔌 Connect Claude.'));
     } else {
       cp.append(el('div', 'claudeanalysis', g.claudePlan.analysis || ''));
-      if (g.claudePlan.notes?.length) {
+      const notes = Array.isArray(g.claudePlan.notes) ? g.claudePlan.notes : (g.claudePlan.notes ? [String(g.claudePlan.notes)] : []);
+      if (notes.length) {
         const ul = el('ul', 'ainotes');
-        for (const n of g.claudePlan.notes) ul.append(el('li', '', n));
+        for (const n of notes) ul.append(el('li', '', n));
         cp.append(ul);
       }
       cp.append(el('div', 'reqhint', `Opus 4.8 set ${g.claudePlan.targetCount} provider targets from the history and requests; the rule engine below placed the shifts so every hard rule holds.`));
