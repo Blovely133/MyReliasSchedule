@@ -302,15 +302,50 @@ function monthList() {
   return [...months].sort();
 }
 
+function nextMonthOf(mo) {
+  const [y, m] = mo.split('-').map(Number);
+  return `${m === 12 ? y + 1 : y}-${String((m % 12) + 1).padStart(2, '0')}`;
+}
+
+/* the month picker is context-aware: the Requests (preferences) view plans
+   FUTURE months — extended through December, defaulting to the first month
+   with no published schedule — while live views (month/swap) stick to
+   published months and default to the current one */
+function monthCtx() {
+  return (state.view === 'requests' && state.reqSub === 'prefs') ? 'prefs' : 'live';
+}
+
+function monthsForCtx(ctx = monthCtx()) {
+  const months = monthList();
+  if (ctx !== 'prefs') return months;
+  const out = months.slice();
+  let last = out[out.length - 1] || TODAY.slice(0, 7);
+  const end = TODAY.slice(0, 4) + '-12';
+  while (last < end) { last = nextMonthOf(last); out.push(last); }
+  return out;
+}
+
+function defaultMonthFor(ctx) {
+  const months = monthList();
+  if (ctx === 'prefs') return nextMonthOf(months[months.length - 1] || TODAY.slice(0, 7));
+  return months.includes(TODAY.slice(0, 7)) ? TODAY.slice(0, 7) : months[0];
+}
+
 function fmtMonth(mo) {
   const [y, m] = mo.split('-').map(Number);
   return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
 }
 
 function renderFilterBar() {
-  const months = monthList();
-  if (!state.month) {
-    state.month = months.includes(TODAY.slice(0, 7)) ? TODAY.slice(0, 7) : months[0];
+  const ctx = monthCtx();
+  const months = monthsForCtx(ctx);
+  state.moByCtx = state.moByCtx || {};
+  if (state.monthCtx !== ctx) {   // view switched contexts — restore its remembered month or its default
+    state.month = state.moByCtx[ctx] || defaultMonthFor(ctx);
+    state.monthCtx = ctx;
+  }
+  if (!state.month || !months.includes(state.month)) {
+    state.month = defaultMonthFor(ctx);
   }
   const ws = $('#weekSelect');
   ws.innerHTML = '';
@@ -1696,6 +1731,8 @@ function wireChrome() {
   $('#nextWeek').onclick = () => { shiftPeriod(1); };
   $('#weekSelect').onchange = e => {
     state.month = e.target.value;
+    state.moByCtx = state.moByCtx || {};
+    state.moByCtx[state.monthCtx || 'live'] = e.target.value;
     render();
   };
   $('#siteFilter').onchange = e => { state.site = e.target.value; state.pos = ''; render(); };
@@ -1739,9 +1776,11 @@ function wireChrome() {
 }
 
 function shiftPeriod(n) {
-  const months = monthList();
+  const months = monthsForCtx();
   const i = months.indexOf(state.month);
   state.month = months[Math.min(Math.max(i + n, 0), months.length - 1)];
+  state.moByCtx = state.moByCtx || {};
+  state.moByCtx[state.monthCtx || 'live'] = state.month;
   render();
 }
 
