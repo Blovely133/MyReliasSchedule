@@ -2881,7 +2881,7 @@ function publishDraft() {
 function renderPublishBar() {
   const bar = $('#publishBar');
   const n = draftCount();
-  const show = n > 0 && state.view === 'builder';
+  const show = n > 0 && (state.view === 'builder' || state.view === 'generate');
   bar.hidden = !show;
   if (!show) return;
   const d = overlay.adminDraft;

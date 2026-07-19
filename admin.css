@@ -42,6 +42,7 @@
 .tabs button.active .tabbadge.draft { background: var(--rh-navy-900); color: var(--rh-yellow); }
 
 /* ---- publish bar ---- */
+.publishbar[hidden] { display: none !important; }   /* display:flex below would otherwise defeat the hidden attribute */
 .publishbar {
   position: sticky;
   top: 60px;
