@@ -1962,6 +1962,24 @@ function openModal(cls, build) {
   return { dlg, body, close };
 }
 
+/* styled in-app confirmation (replaces native confirm() for console actions) */
+function confirmModal({ title, body, confirmLabel, danger, onConfirm }) {
+  openModal('confirm-modal', (mb, close) => {
+    mb.append(el('h2', '', title || 'Please confirm'));
+    if (body) mb.append(el('div', 'confirm-body', body));
+    const actions = el('div', 'dialog-actions');
+    actions.append(el('span', 'spacer'));
+    const cancel = el('button', '', 'Cancel');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    const ok = el('button', danger ? 'confirm-danger' : 'primary', confirmLabel || 'Confirm');
+    ok.type = 'button';
+    ok.onclick = () => { close(); onConfirm && onConfirm(); };
+    actions.append(cancel, ok);
+    mb.append(actions);
+  });
+}
+
 /* enter / modify a single provider's requests on a clickable month calendar */
 function openRequestEditor(initialWho) {
   const g = state.gen;
@@ -2397,14 +2415,19 @@ function proposalChip(res, it) {
   if (it.who) {
     b.classList.add('editable');
     b.title = `${s.start}–${s.end} · ${s.pos} · ${it.who}${it.preferred ? ' · preferred day granted' : ''}\nClick to remove — the shift opens back up.`;
-    b.onclick = () => {
-      if (!confirm(`Open up this shift?\n\n${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos}\n\nRemoves ${it.who}; the slot becomes OPEN.`)) return;
-      removeFromSlot(res, s);
-      recomputeProposalDerived(res);
-      state.gen.applied = false;
-      saveOverlay();
-      render();
-    };
+    b.onclick = () => confirmModal({
+      title: 'Open up this shift?',
+      body: `${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos}\n\nRemoves ${it.who} — the slot becomes OPEN.`,
+      confirmLabel: 'Open it up',
+      danger: true,
+      onConfirm: () => {
+        removeFromSlot(res, s);
+        recomputeProposalDerived(res);
+        state.gen.applied = false;
+        saveOverlay();
+        render();
+      },
+    });
   } else {
     b.classList.add('editable');
     b.title = `Open ${s.pos} · ${s.start}–${s.end}\nClick to assign someone.`;
