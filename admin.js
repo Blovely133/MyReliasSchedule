@@ -1730,6 +1730,7 @@ async function runGenerationSolver(site, mo, opts = {}) {
     const st = stats.get(p.who);
     const r = reqs.get(p.who) || null;
     let cap = (r && r.cap) || p.target + 1;
+    if (opts.capAdjust && opts.capAdjust.has(p.who)) cap = Math.max(0, cap - opts.capAdjust.get(p.who));   // refill: kept shifts already spent it
     let floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
     let overAt = p.target, overW = 40;
     const m = minedMap.get(p.who);
@@ -1952,6 +1953,67 @@ function rebuildProposal(site, mo) {
     g.result = res;
     render();
   }).catch(() => {});   // greedy preview already on screen
+}
+
+/* ---------- proposal repair: clear a provider, refill only the opens ----------
+   The "badly placed provider" workflow: strip someone's proposed shifts (slots
+   reopen) and re-run the optimizer over ONLY the open slots, with every kept
+   assignment locked as fixed context — rest, runs, floors, and caps all still
+   hold across the kept + new combination, but nobody else moves. */
+
+function clearProviderFromProposal(res, who) {
+  const mine = res.assignments.filter(a => a.who === who);
+  if (!mine.length) return 0;
+  const st = res.stats.get(who);
+  for (const a of mine) {
+    if (st) { st.assigned--; st.dates.delete(a.slot.date); st.shiftByDate?.delete(a.slot.date); if (a.preferred) st.preferGot--; }
+    res.unfilled.push(a.slot);
+  }
+  res.assignments = res.assignments.filter(a => a.who !== who);
+  (res.clearedWho = res.clearedWho || new Set()).add(who);   // benched: Refill won't hand the opens back to them
+  recomputeProposalDerived(res);
+  audit(`Proposal edit: cleared ${who} — ${mine.length} slot${mine.length === 1 ? '' : 's'} reopened (excluded from refill until a full regenerate)`, 'ai');
+  return mine.length;
+}
+
+async function refillOpenSlots() {
+  const g = state.gen;
+  const res = g.result;
+  if (!res || g.refilling || !res.unfilled.length) return;
+  g.refilling = true;
+  render();
+  try {
+    const keptByWho = new Map();
+    for (const a of res.assignments) keptByWho.set(a.who, (keptByWho.get(a.who) || 0) + 1);
+    const fixed = res.assignments.map(a => ({ ...a.slot, who: a.who }));
+    const partial = await runGenerationSolver(g.site, g.month, {
+      slots: res.unfilled.slice(),
+      pool: poolFor(g.site, g.month).filter(p => !(res.clearedWho && res.clearedWho.has(p.who))),   // benched providers sit out
+      monthShifts: [...adminShifts().filter(s => s.who && s.date.startsWith(g.month)), ...fixed],
+      capAdjust: keptByWho,   // kept proposal shifts consume the cap — refill can't double-load anyone
+    });
+    const merged = {
+      ...partial,
+      slots: res.slots,
+      skipped: res.skipped,
+      assignments: [...res.assignments, ...partial.assignments].sort((a, b) =>
+        a.slot.date.localeCompare(b.slot.date) || a.slot.start.localeCompare(b.slot.start) || a.slot.pos.localeCompare(b.slot.pos)),
+      clearedWho: res.clearedWho,
+    };
+    for (const a of res.assignments) {   // fold kept assignments back into the per-provider table
+      const st = merged.stats.get(a.who);
+      if (st) { st.assigned++; if (a.preferred) st.preferGot++; }
+    }
+    merged.preferGot = [...merged.stats.values()].reduce((x, s) => x + (s.preferGot || 0), 0);
+    g.result = merged;
+    g.applied = false;
+    audit(`Refilled open slots: ${partial.assignments.length} of ${res.unfilled.length} filled by the optimizer, ${res.assignments.length} kept assignments untouched`, 'ai');
+  } catch (err) {
+    audit(`Refill failed (${String(err.message || err)}) — proposal unchanged`, 'ai');
+  }
+  g.refilling = false;
+  saveOverlay();
+  render();
 }
 
 /* ---------- Analyze: mine the real 6-month schedules into rules ----------
@@ -2648,6 +2710,10 @@ const AGENT_TOOLS = [
     input_schema: { type: 'object', required: ['ops'], properties: { ops: { type: 'array', items: { type: 'object' } } } } },
   { name: 'run_generation', description: 'Rebuild the AI proposal for a site+month with the HiGHS mixed-integer optimizer (in-browser WASM solver; guarantees all hard rules, globally optimizes coverage/floors/preferences; takes ~5–20s). Returns fill stats and per-provider loads. Use this for whole-month placement instead of hand-assigning shifts.',
     input_schema: { type: 'object', properties: { site: { type: 'string' }, month: { type: 'string' } } } },
+  { name: 'clear_provider_proposal', description: 'Remove ALL of one provider\'s shifts from the current AI proposal — the slots become OPEN, nobody else moves, and that provider is benched from refills (a full run_generation brings them back). Follow with refill_open_slots to hand the opens to others. Touches only the proposal, never drafts or the published schedule.',
+    input_schema: { type: 'object', required: ['who'], properties: { who: { type: 'string' } } } },
+  { name: 'refill_open_slots', description: 'Partial regeneration: the optimizer fills ONLY the proposal\'s currently OPEN slots while every existing assignment stays locked (rest/run/load rules hold across the combination). Use after clearing a provider or opening shifts.',
+    input_schema: { type: 'object', properties: {} } },
   { name: 'get_drafts', description: 'List currently staged draft changes (edits/adds/removals) awaiting publish.',
     input_schema: { type: 'object', properties: {} } },
   { name: 'discard_drafts', description: 'Throw away ALL staged draft changes. Only when the user explicitly asks.',
@@ -2741,6 +2807,22 @@ async function agentToolExec(name, input) {
         (under ? ` Below floor: ${under}.` : ' Everyone at/above their floor.') + '\nLoads: ' +
         [...g.result.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned).map(s => `${s.who.replace(/,.*$/, '')} ${s.assigned}/${s.target}`).join(', ');
     }
+    if (name === 'clear_provider_proposal') {
+      if (!g.result) return 'No proposal yet — run run_generation first.';
+      const frag = String(input.who || '').toLowerCase();
+      const full = [...g.result.stats.keys()].find(k => k.toLowerCase().includes(frag));
+      if (!full) return `No provider matching "${input.who}" in the proposal.`;
+      const n = clearProviderFromProposal(g.result, full);
+      g.applied = false;
+      return n ? `Cleared ${full} — ${n} slots reopened (${g.result.unfilled.length} open total). Call refill_open_slots to redistribute.` : `${full} has no proposed shifts.`;
+    }
+    if (name === 'refill_open_slots') {
+      if (!g.result) return 'No proposal yet — run run_generation first.';
+      const before = g.result.unfilled.length;
+      if (!before) return 'Nothing to do — no open slots in the proposal.';
+      await refillOpenSlots();
+      return `Refill done: ${before - g.result.unfilled.length} of ${before} open slots filled by the optimizer (${g.result.engine === 'milp' ? g.result.solver.status : 'greedy'}); ${g.result.unfilled.length} remain open. Kept assignments untouched.`;
+    }
     if (name === 'get_drafts') {
       const d = overlay.adminDraft;
       const edits = Object.entries(d.edits).map(([id, f]) => `edit ${id}: ${JSON.stringify(f)}`);
@@ -2788,7 +2870,7 @@ async function runAgentChat(text) {
   agentConvo.push({ role: 'user', content: text });
   if (agentConvo.length > 40) agentConvo = agentConvo.slice(-30);
   let mutated = false;
-  const MUTATING = new Set(['update_shift', 'add_shift', 'remove_shift', 'set_tier', 'proposal_ops', 'run_generation', 'discard_drafts', 'publish_drafts']);
+  const MUTATING = new Set(['update_shift', 'add_shift', 'remove_shift', 'set_tier', 'proposal_ops', 'run_generation', 'clear_provider_proposal', 'refill_open_slots', 'discard_drafts', 'publish_drafts']);
   for (let hop = 0; hop < 8; hop++) {
     const data = await backendCall('/api/agent', { system: agentSystemPrompt(), messages: agentConvo, tools: AGENT_TOOLS });
     agentConvo.push({ role: 'assistant', content: data.content });
@@ -3685,6 +3767,17 @@ function renderGenerate(main) {
       ? `⚙ Placed by the HiGHS optimizer — mixed-integer model with ${res.solver.vars.toLocaleString()} decision variables and ${res.solver.rows.toLocaleString()} constraints, solved in-browser in ${(res.solver.ms / 1000).toFixed(1)}s (${res.solver.status === 'Optimal' ? 'proven optimal' : res.solver.status}).`
       : '⚙ Placed by the built-in greedy engine — instant preview; the HiGHS optimizer replaces it in the background when available.'));
 
+    if (res.unfilled.length) {
+      const rr = el('div', 'refillrow');
+      const rb = el('button', 'primary', g.refilling ? '⟲ Refilling…' : `⟲ Refill ${res.unfilled.length} open slot${res.unfilled.length === 1 ? '' : 's'}`);
+      rb.type = 'button';
+      rb.disabled = !!g.refilling;
+      rb.title = 'Re-run the optimizer over ONLY the open slots. Everyone already placed stays exactly where they are — rest, run, and load rules still hold across the combination.';
+      rb.onclick = () => refillOpenSlots();
+      rr.append(rb, el('span', 'reqhint', 'fills only the opens — nobody already placed moves. Clear a provider below (✕) first to redo their shifts.'));
+      wrap.append(rr);
+    }
+
     /* proposed month at a glance */
     renderProposalCalendar(wrap, res);
 
@@ -3728,7 +3821,26 @@ function renderGenerate(main) {
     const rfNow = state.gen.roleFilter;
     for (const s of [...res.stats.values()].filter(s => (s.assigned || s.underFloor) && (!rfNow || s.role === rfNow || s.role === 'ANY')).sort((a, b) => b.assigned - a.assigned)) {
       const tr = el('tr');
-      const tdN = el('td', '', s.who);
+      const tdN = el('td');
+      if (s.assigned) {
+        const cx = el('button', 'adjx clearprov', '✕');
+        cx.type = 'button';
+        cx.title = `Clear all ${s.assigned} of ${s.who.replace(/,.*$/, '')}'s proposed shifts — the slots reopen, then hit Refill to give them to others.`;
+        cx.onclick = () => confirmModal({
+          title: 'Clear this provider from the proposal?',
+          body: `${s.who}\n\nRemoves all ${s.assigned} proposed shift${s.assigned === 1 ? '' : 's'} — those slots become OPEN and nobody else moves. “Refill open slots” gives them to OTHER providers; a full Generate brings this person back into play.`,
+          confirmLabel: 'Clear them',
+          danger: true,
+          onConfirm: () => {
+            clearProviderFromProposal(g.result, s.who);
+            g.applied = false;
+            saveOverlay();
+            render();
+          },
+        });
+        tdN.append(cx);
+      }
+      tdN.append(document.createTextNode(s.who));
       if (s.float) tdN.append(el('span', 'floatpill', 'float'));
       tr.append(tdN);
       tr.append(el('td', '', s.role));

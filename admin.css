@@ -423,6 +423,11 @@ table.flat th.sorted { color: var(--rh-yellow); }
 }
 .analyzebox .kpirow { margin-top: 10px; }
 
+/* ---- proposal repair: clear provider + refill opens ---- */
+.refillrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 4px 0 12px; }
+.clearprov { margin-right: 6px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; font-size: 11px; }
+.clearprov:hover { border-color: #ff7a7a; color: #ff9d9d; }
+
 /* ---- card header w/ action button ---- */
 .cardhead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .cardhead h2 { margin: 0; }
