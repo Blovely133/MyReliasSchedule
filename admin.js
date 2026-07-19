@@ -1482,11 +1482,19 @@ function poolFor(site, mo) {
     .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false })), site), site, mo);
 }
 
-/* when Opus 4.8 produced per-provider targets for this exact site+month, use them */
+/* when Opus 4.8 produced per-provider targets for this exact site+month, use them.
+   Opus may aim HIGHER than a provider's baseline but never lower — the floor rule
+   (nobody below average − 1) hangs off the target, so a lowball target would quietly
+   under-schedule people. Explicit request caps still win inside the engine. */
 function withClaudeTargets(pool, site, mo) {
   const ct = state.gen.claudeTargets;
   if (!ct || state.gen.claudeKey !== `${site}|${mo}`) return pool;
-  return pool.map(p => ct.has(p.who) ? { ...p, target: ct.get(p.who), fromAvg: false, fromClaude: true } : p);
+  return pool.map(p => {
+    if (!ct.has(p.who)) return p;
+    const raw = ct.get(p.who);
+    const target = Math.max(raw, p.target);
+    return { ...p, target, fromAvg: false, fromClaude: true, claudeClamped: raw < p.target ? raw : null };
+  });
 }
 
 /* apply structured ops returned by /api/chat (same effect as handleCommand) */
@@ -2408,7 +2416,11 @@ async function stageGenerateClaude() {
   tick();
   try {
     const profiles = timeProfiles();
-    const providers = poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, avg: p.avg || 0, usual: usualShift(profiles.get(p.who)) }));
+    /* send each provider's EFFECTIVE baseline as their average: real worked
+       average when it's a credible signal, otherwise the planned-roster target.
+       Sending the raw noisy average (e.g. 2 stray days at a forecast site) made
+       Opus "honor" a phantom tiny load and lowball everyone. */
+    const providers = poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, avg: p.fromAvg && p.avg ? p.avg : p.target, usual: usualShift(profiles.get(p.who)) }));
     const reqs = [...requestsFor(g.site, g.month).values()]
       .filter(r => providers.some(p => p.who === r.who) || r.source === 'example')
       .map(r => ({ who: r.who, off: [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), prefer: [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), cap: r.cap, note: r.note }));
@@ -2732,7 +2744,9 @@ function renderGenerate(main) {
       if (s.underFloor) { tdA.append(el('span', 'underfloor-tag', ` ⚠ below avg−1 (${s.dates.size}/${s.floor})`)); }
       tr.append(tdA);
       if (s.fromClaude) {
-        tr.append(el('td', '', `${s.target} (Opus)`));
+        tr.append(el('td', '', s.claudeClamped != null
+          ? `${s.target} (Opus said ${s.claudeClamped} — raised to their average)`
+          : `${s.target} (Opus)`));
       } else if (s.fromAvg) {
         tr.append(el('td', '', `${s.target} (avg ${s.avg.toFixed(1)})`));
       } else {

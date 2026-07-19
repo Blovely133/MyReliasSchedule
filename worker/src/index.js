@@ -114,8 +114,8 @@ async function handleChat(env, payload) {
     system,
     userText: text,
     tool: CHAT_TOOL,
-    maxTokens: 1024,
-    effort: 'low',
+    maxTokens: 1536,
+    effort: 'medium',
   });
   return { reply: input.reply, ops: input.ops || [], usage };
 }
@@ -165,7 +165,8 @@ async function handleGenerate(env, payload) {
   const system = [
     `You are a physician scheduler building the ${month} schedule for ${siteName || site}.`,
     `There are ${openSlots} open shifts to fill. Set each provider's monthly target so the schedule is fair and covers as much as possible.`,
-    `Anchor each target to the provider's own recent average days worked (their normal load) — do not exceed it by more than one or two unless a request or shortage clearly warrants it. Honor stated caps. Keep night people on nights.`,
+    `Each provider's target MUST equal their recent average days worked (rounded), or exceed it by one or two when a request or shortage warrants. A target below a provider's average is INVALID OUTPUT — the only legitimate ways someone works less are their own stated cap or days off. Honor stated caps. Keep night people on nights.`,
+    `Write 6-12 specific notes: coverage gaps with numbers, fairness calls you made, requests you honored or couldn't, recruiting needs, and anything a scheduler would double-check.`,
     `If the site is understaffed, say so plainly and estimate how many more providers are needed rather than overloading people. Write for a scheduler, not an executive.`,
     rules ? `Standing rules: ${rules}` : '',
   ].filter(Boolean).join('\n\n');
@@ -174,8 +175,8 @@ async function handleGenerate(env, payload) {
     system,
     userText,
     tool: GEN_TOOL,
-    maxTokens: 2048,
-    effort: 'medium',
+    maxTokens: 3072,
+    effort: 'high',
   });
   const notes = Array.isArray(input.notes)
     ? input.notes
