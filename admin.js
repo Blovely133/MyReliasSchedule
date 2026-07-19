@@ -1570,6 +1570,11 @@ function runGeneration(site, mo) {
     const st = stats.get(s.who);
     if (st) { st.dates.add(s.date); st.shiftByDate.set(s.date, s); }
   }
+  for (const st of stats.values()) {
+    st.preDates = st.dates.size;
+    const m = minedMap.get(st.who);
+    if (m && m.loadN != null && m.loadHard) st.minedLoadFloor = m.loadN;
+  }
   const assignments = [];
   const unfilled = [];
   const capsHit = new Set();
@@ -1581,8 +1586,10 @@ function runGeneration(site, mo) {
       if (need !== 'ANY' && p.role !== 'ANY' && p.role !== need) continue;
       const st = stats.get(p.who);
       const r = reqs.get(p.who);
+      const mined = minedMap.get(p.who);
       if (r && r.off.has(slot.date)) continue;                                   // hard: unavailable
-      const cap = (r && r.cap) || p.target + 1;                                  // hard: never more than 1 over their average/target
+      let cap = (r && r.cap) || p.target + 1;                                    // hard: never more than 1 over their average/target
+      if (mined && mined.loadN != null && mined.loadHard && !(r && r.cap)) cap = Math.max(0, mined.loadN - st.preDates);  // mined: exactly-N months pin the cap
       if (st.assigned >= cap) { if (r && r.cap) capsHit.add(p.who); continue; }
       if (st.dates.has(slot.date)) continue;                                     // hard: one shift/day
       const prevShift = st.shiftByDate.get(addDays(slot.date, -1));              // hard: ≥10h rest between shifts
@@ -1593,15 +1600,16 @@ function runGeneration(site, mo) {
       const bucket = shiftBucket(slot);
       if (st.tod) { if (bucket !== st.tod) continue; }                           // hard: assistant rule ("nights only")
       else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
-      const mined = minedMap.get(p.who);
       if (mined && minedBlocks(mined, slot, slotDow)) continue;                  // hard: mined-from-history rules
       let score = 0;
       if (mined) score += minedScore(mined, slot, slotDow);                      // soft: mined-from-history rules
       if (!st.tod && st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
       /* floor rule: nobody ends the month below their average minus one — a
          provider still under floor outbids every other consideration.
-         PRN is exempt: "as needed" carries no guaranteed load. */
-      const floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
+         PRN is exempt: "as needed" carries no guaranteed load.
+         Exactly-N providers' floor IS their N. */
+      let floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
+      if (st.minedLoadFloor != null && !(r && r.cap)) floor = st.minedLoadFloor;
       if (st.dates.size < floor) score += 400 + (floor - st.dates.size) * 10;
       if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
       if (st.dates.has(addDays(slot.date, -1))) score += Math.round(45 * (mined ? mined.blockMult : 1));  // build blocks (mined style scales it)
@@ -1635,6 +1643,7 @@ function finishGenResult({ site, mo, slots, skipped, assignments, unfilled, stat
     st.longestRun = bestRun;
     const r = reqs.get(st.who);
     st.floor = tierOf(st.who, st.float) === 'prn' ? 0 : Math.max(0, Math.min(st.target - 1, (r && r.cap) || Infinity));
+    if (st.minedLoadFloor != null && !(r && r.cap)) st.floor = st.minedLoadFloor;
     st.underFloor = st.dates.size < st.floor;
   }
   const underFloor = [...stats.values()].filter(st => st.underFloor).map(st => st.who);
@@ -1719,12 +1728,22 @@ async function runGenerationSolver(site, mo, opts = {}) {
   pool.forEach((p, pi) => {
     const st = stats.get(p.who);
     const r = reqs.get(p.who) || null;
-    byProv.set(p.who, {
-      p, pi, st, r,
-      cap: (r && r.cap) || p.target + 1,
-      floor: tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity)),
-      byDay: new Map(), names: [],
-    });
+    let cap = (r && r.cap) || p.target + 1;
+    let floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
+    let overAt = p.target, overW = 40;
+    const m = minedMap.get(p.who);
+    if (m && m.loadN != null && !(r && r.cap)) {   // an explicit request cap outranks the mined load rule
+      if (m.loadHard) {
+        cap = Math.max(0, m.loadN - st.dates.size);   // total days pinned at N (cap counts NEW assignments)
+        floor = m.loadN;
+        st.minedLoadFloor = m.loadN;
+      } else {
+        floor = Math.max(floor, m.loadN - 1);
+        overAt = m.loadN;
+        overW = 80;   // steady-N providers: leaving N costs real points, but genuine variation can still win
+      }
+    }
+    byProv.set(p.who, { p, pi, st, r, cap, floor, overAt, overW, byDay: new Map(), names: [] });
   });
   slots.forEach((slot, si) => {
     const need = slotRole(slot.pos);
@@ -1825,11 +1844,12 @@ async function runGenerationSolver(site, mo, opts = {}) {
       obj.push(`- 450 u${pi}`);
     }
 
-    /* soft load-balance: days beyond target cost a little, so extras spread out */
-    const room = p.target - st.dates.size;
+    /* soft load-balance: days beyond target cost a little, so extras spread out
+       (steady-N providers get a much steeper pull back to their N) */
+    const room = pr.overAt - st.dates.size;
     if (wNames.length > room) {
       addCon(`${wNames.join(' + ')} - o${pi} <= ${room}`);
-      obj.push(`- 40 o${pi}`);
+      obj.push(`- ${pr.overW} o${pi}`);
     }
 
     /* block scheduling: reward back-to-back worked days (greedy's +45),
@@ -1853,7 +1873,7 @@ async function runGenerationSolver(site, mo, opts = {}) {
   await new Promise(r => setTimeout(r, 30));   // let the status line paint before the sync solve
   /* stop within 0.5% of provably optimal — the last fraction of a percent is
      pure proof time, not schedule quality */
-  const sol = highs.solve(lp, { time_limit: SOLVER_TIME_LIMIT_S, mip_rel_gap: 0.005 });
+  const sol = highs.solve(lp, { time_limit: opts.timeLimit || SOLVER_TIME_LIMIT_S, mip_rel_gap: 0.005 });
   const okStatus = ['Optimal', 'Time limit reached', 'Bound on objective reached', 'Target for objective reached'];
   if (!okStatus.includes(sol.Status)) throw new Error(`HiGHS status: ${sol.Status}`);
 
@@ -1984,6 +2004,33 @@ function mineHistory(excludeMo) {
     const modeRun = [...runs.reduce((m, r) => m.set(r, (m.get(r) || 0) + 1), new Map())].sort((a, b) => b[1] - a[1])[0][0];
     if (modeRun >= 5) out.push({ kind: 'blockStyle', mult: 2, mode: 'soft', conf: Math.min(1, meanRun / 7), support: runs.length, text: `${first}: long stretches (typical block ${modeRun}, avg ${meanRun.toFixed(1)})` });
     else if (meanRun < 1.5 && runs.length >= 6) out.push({ kind: 'blockStyle', mult: 0.3, mode: 'soft', conf: Math.min(1, 1 - meanRun / 3), support: runs.length, text: `${first}: mostly single days (avg block ${meanRun.toFixed(1)})` });
+    /* load consistency: someone who works the same number of days every single
+       complete month is telling you their contract, not a coincidence — pin it.
+       (hard = cap at N and floor raised to N; near-constant = soft pull to N) */
+    const byMo = new Map();
+    for (const d of list) { const m = d.slice(0, 7); byMo.set(m, (byMo.get(m) || 0) + 1); }
+    const allComplete = [];
+    for (let m = minD.slice(0, 7); m <= maxD.slice(0, 7); ) {
+      const [y2, mm] = m.split('-').map(Number);
+      const lastDay = `${m}-${String(new Date(y2, mm, 0).getDate()).padStart(2, '0')}`;
+      if (minD <= m + '-01' && maxD >= lastDay && (!excludeMo || m !== excludeMo)) allComplete.push(m);
+      m = `${mm === 12 ? y2 + 1 : y2}-${String((mm % 12) + 1).padStart(2, '0')}`;
+    }
+    if (allComplete.length >= 4) {
+      const counts = allComplete.map(m => byMo.get(m) || 0);
+      const mx2 = Math.max(...counts), mn2 = Math.min(...counts);
+      if (mn2 >= 1) {   // worked every complete month — a real monthly rhythm
+        if (mx2 === mn2) {
+          /* hard pinning takes 5+ invariant months — at 4 the backtest proved
+             invariance is often coincidence (5 of 15 pins were wrong blind) */
+          const hard = allComplete.length >= 5;
+          out.push({ kind: 'loadExact', n: mx2, mode: hard ? 'hard' : 'soft', conf: hard ? 1 : 0.8, support: allComplete.length, text: `${first}: exactly ${mx2} days every month (${allComplete.length} of ${allComplete.length} months)` });
+        } else if (mx2 - mn2 <= 2) {
+          const med = counts.slice().sort((a, b) => a - b)[counts.length >> 1];
+          out.push({ kind: 'loadTight', n: med, mode: 'soft', conf: 1 - (mx2 - mn2) / 4, support: allComplete.length, text: `${first}: steady ${med}±1 days/month (range ${mn2}–${mx2})` });
+        }
+      }
+    }
     /* position loyalty — SOFT by default even at 100%: coverage outranks zone
        loyalty (hard zone-locks cratered fill at multi-zone sites), and the
        scheduler can promote any chip to HARD when it's a true credential line */
@@ -2024,7 +2071,7 @@ function compileMinedRules(an = overlay.analyze) {
   const map = new Map();
   if (!an || !an.rules) return map;
   for (const [who, rs] of Object.entries(an.rules)) {
-    const c = { dowNever: new Set(), dowAvoid: new Set(), weekendNever: false, weekendBias: 0, dowShare: null, blockMult: 1, posOnly: null, posPrefer: null };
+    const c = { dowNever: new Set(), dowAvoid: new Set(), weekendNever: false, weekendBias: 0, dowShare: null, blockMult: 1, posOnly: null, posPrefer: null, loadN: null, loadHard: false };
     let any = false;
     for (const r of rs) {
       if (r.mode === 'off') continue;
@@ -2037,6 +2084,8 @@ function compileMinedRules(an = overlay.analyze) {
       else if (r.kind === 'blockStyle') c.blockMult = r.mult;
       else if (r.kind === 'posOnly') { if (hard) c.posOnly = r.pos; else c.posPrefer = r.pos; }
       else if (r.kind === 'posPrefer') c.posPrefer = r.pos;
+      else if (r.kind === 'loadExact') { c.loadN = r.n; c.loadHard = hard; }
+      else if (r.kind === 'loadTight') { c.loadN = r.n; c.loadHard = false; }
     }
     if (any) map.set(who, c);
   }
@@ -2111,6 +2160,7 @@ async function runBacktest(site, mo) {
       slots, pool, reqs: new Map(), profiles, maxRun: 5, monthShifts,
       edgeShifts: base.filter(s => !s.forecast && s.who),   // real adjacent-month shifts anchor rotation phase
       minedMap: overlay.analyze ? compileMinedRules(minedEx) : new Map(),
+      timeLimit: 60,   // diagnostics can afford a real solve — load pins tighten the MIP
     });
     const realById = new Map(real.map(s => [s.id, s.who]));
     let match = 0;
