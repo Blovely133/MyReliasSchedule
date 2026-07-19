@@ -21,8 +21,8 @@ let base = [];          // [{id,date,pos,start,end,who,site,note}]
 let overlay = EMPTY_OVERLAY();
 let state = {
   view: 'approvals',
-  weekStart: null,      // ISO date of a Sunday
-  month: null,          // 'YYYY-MM'
+  month: null,          // 'YYYY-MM' — every periodized view runs on months
+
   site: '',
   pos: '',
   search: '',
@@ -350,35 +350,30 @@ function suggestFor(shift, topN = 8) {
 
 /* ---------- filter bar ---------- */
 
-function weekList() {
-  return [...new Set(adminShifts().map(s => sundayOf(s.date)))].sort();
-}
 function monthList() {
   return [...new Set(adminShifts().map(s => s.date.slice(0, 7)))].sort();
 }
+function addMonths(mo, n) {
+  const [y, m] = mo.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1 + n, 1)).toISOString().slice(0, 7);
+}
+function monthDays(mo) {
+  const [y, m] = mo.split('-').map(Number);
+  const daysIn = new Date(y, m, 0).getDate();
+  return Array.from({ length: daysIn }, (_, i) => `${mo}-${String(i + 1).padStart(2, '0')}`);
+}
 
 function renderFilterBar() {
-  const weeks = weekList();
-  if (!state.weekStart) state.weekStart = weeks.includes(sundayOf(TODAY)) ? sundayOf(TODAY) : weeks[0];
   const months = monthList();
   if (!state.month) state.month = months.includes(TODAY.slice(0, 7)) ? TODAY.slice(0, 7) : months[0];
 
   const ws = $('#weekSelect');
   ws.innerHTML = '';
-  if (state.view === 'coverage') {
-    for (const w of weeks) {
-      const o = el('option', '', `2 weeks from ${fmtDate(w)}`);
-      o.value = w;
-      if (w === state.weekStart) o.selected = true;
-      ws.append(o);
-    }
-  } else {
-    for (const mo of months) {
-      const o = el('option', '', fmtMonth(mo));
-      o.value = mo;
-      if (mo === state.month) o.selected = true;
-      ws.append(o);
-    }
+  for (const mo of months) {
+    const o = el('option', '', fmtMonth(mo));
+    o.value = mo;
+    if (mo === state.month) o.selected = true;
+    ws.append(o);
   }
 
   const sf = $('#siteFilter');
@@ -438,7 +433,7 @@ function conflictChips(td, name, shift) {
 
 function renderApprovals(main) {
   const { swaps, subs, msgs } = pendingCounts();
-  const opens14 = publishedShifts().filter(s => !s.who && s.date >= TODAY && s.date <= addDays(TODAY, 13)).length;
+  const opensMonth = publishedShifts().filter(s => !s.who && s.date >= TODAY && s.date.startsWith(TODAY.slice(0, 7))).length;
   $('#weekStats').textContent = `${swaps} swap${swaps === 1 ? '' : 's'} to approve · ${subs} submission${subs === 1 ? '' : 's'} to review · ${msgs} message${msgs === 1 ? '' : 's'} awaiting reply`;
 
   const wrap = el('div', 'reqwrap');
@@ -446,7 +441,7 @@ function renderApprovals(main) {
   kpis.append(kpi(swaps, 'Swaps & pickups to approve', swaps ? 'warn' : 'ok'));
   kpis.append(kpi(subs, 'Time-off submissions to review', subs ? 'warn' : 'ok'));
   kpis.append(kpi(msgs, 'Messages awaiting reply', msgs ? 'warn' : 'ok'));
-  kpis.append(kpi(opens14, 'Open shifts, next 14 days', opens14 ? 'warn' : 'ok', () => { state.covFocus = null; setView('coverage'); }));
+  kpis.append(kpi(opensMonth, 'Open shifts left this month', opensMonth ? 'warn' : 'ok', () => { state.covFocus = null; state.month = TODAY.slice(0, 7); setView('coverage'); }));
   wrap.append(kpis);
 
   const q = state.search.toLowerCase();
@@ -672,9 +667,8 @@ function renderApprovals(main) {
 /* ---------- coverage board ---------- */
 
 function renderCoverage(main) {
-  const start = state.weekStart;
-  const days = Array.from({ length: 14 }, (_, i) => addDays(start, i));
-  const inWindow = filtered(adminShifts()).filter(s => s.date >= days[0] && s.date <= days[13]);
+  const days = monthDays(state.month);
+  const inWindow = filtered(adminShifts()).filter(s => s.date.startsWith(state.month));
   const q = state.search.toLowerCase();
 
   const bySiteDay = new Map();   // site -> date -> shifts
@@ -690,10 +684,10 @@ function renderCoverage(main) {
   const openTotal = inWindow.filter(s => !s.who && s.date >= TODAY).length;
   const gapSites = [...bySiteDay.entries()].filter(([, m]) => [...m.values()].some(list => list.some(s => !s.who && s.date >= TODAY))).length;
   const draftPending = draftCount();
-  $('#weekStats').textContent = `${fmtDate(days[0])} – ${fmtDate(days[13])} · ${openTotal} unfilled shift${openTotal === 1 ? '' : 's'} across ${gapSites} site${gapSites === 1 ? '' : 's'}`;
+  $('#weekStats').textContent = `${fmtMonth(state.month)} · ${openTotal} unfilled upcoming shift${openTotal === 1 ? '' : 's'} across ${gapSites} site${gapSites === 1 ? '' : 's'}`;
 
   const kpis = el('div', 'kpirow');
-  kpis.append(kpi(openTotal, 'Unfilled in this window', openTotal ? 'warn' : 'ok'));
+  kpis.append(kpi(openTotal, 'Unfilled this month (upcoming)', openTotal ? 'warn' : 'ok'));
   kpis.append(kpi(gapSites, 'Sites with gaps', gapSites ? 'warn' : 'ok'));
   kpis.append(kpi(draftPending, 'Draft changes awaiting publish', draftPending ? 'draftk' : ''));
   main.append(kpis);
@@ -725,7 +719,7 @@ function renderCoverage(main) {
   const thead = el('thead');
   const hr = el('tr');
   hr.append(el('th', 'sitecol', 'Site'));
-  for (const d of days) hr.append(el('th', d === TODAY ? 'today' : '', fmtDayCol(d)));
+  for (const d of days) hr.append(el('th', (d === TODAY ? 'today ' : '') + (isWeekendDate(d) ? 'wknd' : ''), fmtDayCol(d)));
   thead.append(hr);
   table.append(thead);
   const tbody = el('tbody');
@@ -737,7 +731,7 @@ function renderCoverage(main) {
     th.append(el('span', 'sitesub', `${site} · ${winOpens ? winOpens + ' unfilled' : 'covered'}`));
     tr.append(th);
     for (const d of days) {
-      const td = el('td');
+      const td = el('td', isWeekendDate(d) ? 'wknd' : '');
       const cell = (bySiteDay.get(site).get(d) || []);
       const open = cell.filter(s => !s.who).length;
       const hasDraft = cell.some(s => s.draft);
@@ -833,56 +827,60 @@ function renderBuilder(main) {
   const drafts = list.filter(s => s.draft).length;
   $('#weekStats').textContent = `${fmtMonth(mo)} · ${list.length.toLocaleString()} shifts · ${open} open · ${drafts} draft`;
 
-  /* copy-week tool */
+  /* copy-month tool */
   const tool = el('div', 'reqform copytool');
-  tool.append(el('h2', '', 'Copy a week forward'));
+  tool.append(el('h2', '', 'Copy a month forward'));
   const row = el('div', 'reqrow');
-  const weeks = weekList();
-  /* target list also offers blank future weeks past the data range — that's
+  const months = monthList();
+  /* target list also offers blank future months past the data range — that's
      how the next schedule period gets scaffolded */
-  const dstWeeks = [...weeks];
-  for (let i = 1; i <= 5; i++) dstWeeks.push(addDays(weeks[weeks.length - 1], i * 7));
+  const dstMonths = [...months];
+  for (let i = 1; i <= 3; i++) dstMonths.push(addMonths(months[months.length - 1], i));
   const mkSel = list => {
     const sel = document.createElement('select');
-    for (const w of list) {
-      const o = el('option', '', `Week of ${fmtDate(w)}${weeks.includes(w) ? '' : ' (new week)'}`);
-      o.value = w;
+    for (const m2 of list) {
+      const o = el('option', '', `${fmtMonth(m2)}${months.includes(m2) ? '' : ' (new month)'}`);
+      o.value = m2;
       sel.append(o);
     }
     return sel;
   };
-  const srcSel = mkSel(weeks);
-  const dstSel = mkSel(dstWeeks);
-  const idx = weeks.indexOf(sundayOf(TODAY));
-  if (idx >= 0) srcSel.value = weeks[idx];
-  if (idx >= 0 && weeks[idx + 1]) dstSel.value = weeks[idx + 1];
+  const srcSel = mkSel(months);
+  const dstSel = mkSel(dstMonths);
+  srcSel.value = state.month;
+  const nextMo = addMonths(state.month, 1);
+  dstSel.value = dstMonths.includes(nextMo) ? nextMo : dstMonths[dstMonths.length - 1];
   const lb = (txt, inp) => { const l = el('label', '', txt + ' '); l.append(inp); return l; };
   row.append(lb('Copy shifts from', srcSel), lb('into', dstSel));
   const go = el('button', 'primary', 'Copy → draft');
   go.type = 'button';
   go.onclick = () => {
     const src = srcSel.value, dst = dstSel.value;
-    if (src === dst) { alert('Pick two different weeks.'); return; }
-    const srcShifts = filtered(adminShifts()).filter(s => s.date >= src && s.date <= addDays(src, 6));
-    if (!srcShifts.length) { alert('No shifts in the source week (with these filters).'); return; }
-    const existing = new Set(adminShifts().map(s => [s.date, s.pos, s.start, s.end, s.who, s.site].join('|')));
+    if (src === dst) { alert('Pick two different months.'); return; }
+    const srcShifts = filtered(adminShifts()).filter(s => s.date.startsWith(src));
+    if (!srcShifts.length) { alert('No shifts in the source month (with these filters).'); return; }
     const scope = state.site ? `${siteName(state.site)}` : 'ALL sites';
-    if (!confirm(`Copy ${srcShifts.length} shifts (${scope}${state.pos ? ` · ${state.pos}` : ''}) from the week of ${fmtDate(src)} into the week of ${fmtDate(dst)} as drafts?`)) return;
-    let n = 0;
+    if (!confirm(`Copy ${srcShifts.length} shifts (${scope}${state.pos ? ` · ${state.pos}` : ''}) from ${fmtMonth(src)} into ${fmtMonth(dst)} as drafts?\n\nWeekdays stay aligned (first week maps to first week); days that fall outside ${fmtMonth(dst)} are skipped.`)) return;
+    const existing = new Set(adminShifts().map(s => [s.date, s.pos, s.start, s.end, s.who, s.site].join('|')));
+    /* weekday-aligned mapping: offset both months from the Sunday on/before the 1st */
+    const anchorSrc = sundayOf(src + '-01');
+    const anchorDst = sundayOf(dst + '-01');
+    let n = 0, outside = 0;
     for (const s of srcShifts) {
-      const offset = Math.round((Date.parse(s.date) - Date.parse(src)) / 86400000);
-      const date = addDays(dst, offset);
+      const offset = Math.round((Date.parse(s.date) - Date.parse(anchorSrc)) / 86400000);
+      const date = addDays(anchorDst, offset);
+      if (!date.startsWith(dst)) { outside++; continue; }
       if (existing.has([date, s.pos, s.start, s.end, s.who, s.site].join('|'))) continue;
       overlay.adminDraft.added.push({ id: nextAddId(), date, pos: s.pos, start: s.start, end: s.end, who: s.who, site: s.site, note: s.note });
       n++;
     }
     saveOverlay();
-    audit(`Draft: copied ${n} shifts from week of ${fmtDate(src)} to week of ${fmtDate(dst)} (${scope})`, 'edit');
+    audit(`Draft: copied ${n} shifts from ${fmtMonth(src)} to ${fmtMonth(dst)} (${scope}${outside ? `; ${outside} fell outside the month` : ''})`, 'edit');
     render();
   };
   row.append(go);
   tool.append(row);
-  tool.append(el('div', 'reqhint', 'Copies every shift (assignments included) with your current site/position filters applied, skipping duplicates. Review in the calendar, then publish.'));
+  tool.append(el('div', 'reqhint', 'Copies every shift (assignments included) with your current site/position filters applied, weekday-aligned, skipping duplicates. Review edge days in the calendar, then publish.'));
   main.append(tool);
 
   /* month grid */
@@ -1280,9 +1278,8 @@ function exportCsv() {
   let list;
   let name;
   if (state.view === 'coverage') {
-    const end = addDays(state.weekStart, 13);
-    list = filtered(adminShifts()).filter(s => !s.who && s.date >= state.weekStart && s.date <= end);
-    name = `open-shifts-${state.weekStart}.csv`;
+    list = filtered(adminShifts()).filter(s => !s.who && s.date.startsWith(state.month));
+    name = `open-shifts-${state.month}.csv`;
   } else {
     list = filtered(adminShifts()).filter(s => s.date.startsWith(state.month));
     name = `schedule-${state.month}.csv`;
@@ -1344,10 +1341,10 @@ function renderBadges() {
   const bA = $('#badgeApprovals');
   bA.hidden = !pend;
   bA.textContent = String(pend);
-  const opens14 = publishedShifts().filter(s => !s.who && s.date >= TODAY && s.date <= addDays(TODAY, 13)).length;
+  const opensMonth = publishedShifts().filter(s => !s.who && s.date >= TODAY && s.date.startsWith(TODAY.slice(0, 7))).length;
   const bC = $('#badgeCoverage');
-  bC.hidden = !opens14;
-  bC.textContent = String(opens14);
+  bC.hidden = !opensMonth;
+  bC.textContent = String(opensMonth);
   const bB = $('#badgeBuilder');
   const n = draftCount();
   bB.hidden = !n;
@@ -1355,15 +1352,9 @@ function renderBadges() {
 }
 
 function shiftPeriod(n) {
-  if (state.view === 'coverage') {
-    const weeks = weekList();
-    const i = weeks.indexOf(state.weekStart);
-    state.weekStart = weeks[Math.min(Math.max(i + n, 0), weeks.length - 1)];
-  } else {
-    const months = monthList();
-    const i = months.indexOf(state.month);
-    state.month = months[Math.min(Math.max(i + n, 0), months.length - 1)];
-  }
+  const months = monthList();
+  const i = months.indexOf(state.month);
+  state.month = months[Math.min(Math.max(i + n, 0), months.length - 1)];
   render();
 }
 
@@ -1380,11 +1371,7 @@ function wireChrome() {
   document.querySelectorAll('#viewTabs button').forEach(b => b.onclick = () => setView(b.dataset.view));
   $('#prevWeek').onclick = () => shiftPeriod(-1);
   $('#nextWeek').onclick = () => shiftPeriod(1);
-  $('#weekSelect').onchange = e => {
-    if (state.view === 'coverage') state.weekStart = e.target.value;
-    else state.month = e.target.value;
-    render();
-  };
+  $('#weekSelect').onchange = e => { state.month = e.target.value; render(); };
   $('#siteFilter').onchange = e => { state.site = e.target.value; state.pos = ''; render(); };
   $('#posFilter').onchange = e => { state.pos = e.target.value; render(); };
   $('#searchBox').oninput = e => { state.search = e.target.value; render(); };

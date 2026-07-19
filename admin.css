@@ -129,7 +129,9 @@ button.kpi:hover { border-color: var(--rh-yellow); }
 
 /* ---- coverage board ---- */
 .covwrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
-table.cov { border-collapse: collapse; width: 100%; min-width: 1080px; }
+table.cov { border-collapse: collapse; width: 100%; min-width: 2050px; }
+table.cov thead th.wknd { background: color-mix(in srgb, var(--rh-navy) 45%, var(--panel)); }
+table.cov td.wknd { background: color-mix(in srgb, var(--rh-navy) 22%, var(--bg)); }
 table.cov th, table.cov td { border: 1px solid var(--line); padding: 3px; }
 table.cov thead th {
   position: sticky;
