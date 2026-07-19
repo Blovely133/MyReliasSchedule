@@ -174,6 +174,23 @@ async function unlockData() {
   const input = $('#accessPin');
   const submit = $('#accessSubmit');
   const error = $('#accessError');
+  const unlocked = () => {
+    /* fresh chat each login — the conversation log shouldn't persist between
+       sessions (adjustment chips DO persist; they're real schedule changes) */
+    if (overlay.genChat.length) { overlay.genChat = []; saveOverlay(); }
+    $('#accessGate').remove();
+    document.body.classList.remove('access-locked');
+  };
+  /* same-origin surfaces (employee app, rhPORTAL) store the shared team PIN
+     after a successful unlock — try it silently before prompting */
+  try {
+    const shared = localStorage.getItem('mrs-shared-pin');
+    if (shared) {
+      await loadData(shared);
+      unlocked();
+      return;
+    }
+  } catch {}
   while (true) {
     const pin = await waitForPinAttempt();
     submit.disabled = true;
@@ -181,11 +198,8 @@ async function unlockData() {
     error.textContent = '';
     try {
       await loadData(pin);
-      /* fresh chat each login — the conversation log shouldn't persist between
-         sessions (adjustment chips DO persist; they're real schedule changes) */
-      if (overlay.genChat.length) { overlay.genChat = []; saveOverlay(); }
-      $('#accessGate').remove();
-      document.body.classList.remove('access-locked');
+      try { localStorage.setItem('mrs-shared-pin', pin); } catch {}
+      unlocked();
       return;
     } catch (err) {
       error.textContent = err.message.startsWith('Could not load') || err.message.startsWith('Web Crypto')
@@ -371,6 +385,12 @@ function providerRole(s) {
   if (/\b(physician|doctor|doc|hospitalist|nocturnist|rounder)\b/i.test(position) || /(?:,|\s)\s*(MD|DO)\b/i.test(person)) return 'PHY';
   return '';
 }
+
+/* people tagged "(deleted)" in the W2W export keep their historical shifts
+   but are never offered for new work */
+function isDeletedName(n) {
+  return /\(deleted\)\s*$/i.test(n || '');
+}
 function matchesSearch(s, q) {
   return s.who.toLowerCase().includes(q) || s.pos.toLowerCase().includes(q) ||
     s.site.toLowerCase().includes(q) || siteName(s.site).toLowerCase().includes(q);
@@ -438,7 +458,7 @@ function suggestFor(shift, topN = 8) {
   };
   const pref = name => (overlay.prefs[name] || {})[shift.date] || null;
   return [...worksSite]
-    .filter(n => !busy.has(n) && pref(n) !== 'no')
+    .filter(n => !busy.has(n) && pref(n) !== 'no' && !isDeletedName(n))
     .filter(n => {
       if (need !== 'PHY' && need !== 'APC') return true;
       const d = disciplineOf(n);
@@ -703,11 +723,18 @@ function renderApprovals(main) {
       const pull = el('button', 'danger', 'Withdraw');
       pull.title = 'Remove this offer from the board on the employee’s behalf';
       pull.onclick = () => {
-        if (!confirm(`Withdraw ${t.who}'s offer from the board?`)) return;
-        t.status = 'cancelled';
-        pushNotif(t.who, `The scheduler withdrew your ${s ? fmtDate(s.date) + ' ' : ''}swap offer`, 'requests', 'swap');
-        audit(`Withdrew ${t.who}'s swap offer${s ? ` — ${describeShift(s)}` : ''}`, 'denial');
-        saveOverlay(); render();
+        confirmModal({
+          title: `Withdraw ${t.who.replace(/,.*$/, '')}'s offer from the board?`,
+          body: `${s ? describeShift(s) + ' — ' : ''}${t.who} is notified that the scheduler pulled it.`,
+          confirmLabel: 'Withdraw offer',
+          danger: true,
+          onConfirm: () => {
+            t.status = 'cancelled';
+            pushNotif(t.who, `The scheduler withdrew your ${s ? fmtDate(s.date) + ' ' : ''}swap offer`, 'requests', 'swap');
+            audit(`Withdrew ${t.who}'s swap offer${s ? ` — ${describeShift(s)}` : ''}`, 'denial');
+            saveOverlay(); render();
+          },
+        });
       };
       tdA.append(pull);
       tr.append(tdA);
@@ -993,23 +1020,29 @@ function renderBuilder(main) {
     const srcShifts = filtered(adminShifts()).filter(s => s.date.startsWith(src));
     if (!srcShifts.length) { alert('No shifts in the source month (with these filters).'); return; }
     const scope = state.site ? `${siteName(state.site)}` : 'ALL sites';
-    if (!confirm(`Copy ${srcShifts.length} shifts (${scope}${state.pos ? ` · ${state.pos}` : ''}) from ${fmtMonth(src)} into ${fmtMonth(dst)} as drafts?\n\nWeekdays stay aligned (first week maps to first week); days that fall outside ${fmtMonth(dst)} are skipped.`)) return;
-    const existing = new Set(adminShifts().map(s => [s.date, s.pos, s.start, s.end, s.who, s.site].join('|')));
-    /* weekday-aligned mapping: offset both months from the Sunday on/before the 1st */
-    const anchorSrc = sundayOf(src + '-01');
-    const anchorDst = sundayOf(dst + '-01');
-    let n = 0, outside = 0;
-    for (const s of srcShifts) {
-      const offset = Math.round((Date.parse(s.date) - Date.parse(anchorSrc)) / 86400000);
-      const date = addDays(anchorDst, offset);
-      if (!date.startsWith(dst)) { outside++; continue; }
-      if (existing.has([date, s.pos, s.start, s.end, s.who, s.site].join('|'))) continue;
-      overlay.adminDraft.added.push({ id: nextAddId(), date, pos: s.pos, start: s.start, end: s.end, who: s.who, site: s.site, note: s.note });
-      n++;
-    }
-    saveOverlay();
-    audit(`Draft: copied ${n} shifts from ${fmtMonth(src)} to ${fmtMonth(dst)} (${scope}${outside ? `; ${outside} fell outside the month` : ''})`, 'edit');
-    render();
+    confirmModal({
+      title: `Copy ${srcShifts.length} shifts from ${fmtMonth(src)} into ${fmtMonth(dst)}?`,
+      body: `${scope}${state.pos ? ` · ${state.pos}` : ''} — copied as drafts, weekday-aligned (first week maps to first week); days that fall outside ${fmtMonth(dst)} are skipped.`,
+      confirmLabel: 'Copy → draft',
+      onConfirm: () => {
+        const existing = new Set(adminShifts().map(s => [s.date, s.pos, s.start, s.end, s.who, s.site].join('|')));
+        /* weekday-aligned mapping: offset both months from the Sunday on/before the 1st */
+        const anchorSrc = sundayOf(src + '-01');
+        const anchorDst = sundayOf(dst + '-01');
+        let n = 0, outside = 0;
+        for (const s of srcShifts) {
+          const offset = Math.round((Date.parse(s.date) - Date.parse(anchorSrc)) / 86400000);
+          const date = addDays(anchorDst, offset);
+          if (!date.startsWith(dst)) { outside++; continue; }
+          if (existing.has([date, s.pos, s.start, s.end, s.who, s.site].join('|'))) continue;
+          overlay.adminDraft.added.push({ id: nextAddId(), date, pos: s.pos, start: s.start, end: s.end, who: s.who, site: s.site, note: s.note });
+          n++;
+        }
+        saveOverlay();
+        audit(`Draft: copied ${n} shifts from ${fmtMonth(src)} to ${fmtMonth(dst)} (${scope}${outside ? `; ${outside} fell outside the month` : ''})`, 'edit');
+        render();
+      },
+    });
   };
   row.append(go);
   /* Revise Schedule: open the month you're viewing in the optimizer, with the
@@ -3716,7 +3749,7 @@ function openSlotPicker(res, slot) {
     body.append(search);
     const cands = proposalCandidates(res, slot);
     const candWho = new Set(cands.map(c => c.who));
-    const everyone = [...new Set(base.filter(s => s.who).map(s => s.who))].sort();
+    const everyone = [...new Set(base.filter(s => s.who).map(s => s.who))].filter(n => !isDeletedName(n)).sort();
     const list = el('div', 'pickerlist');
     body.append(list);
     const rowBtn = (who, metaText, warn) => {
@@ -4322,6 +4355,9 @@ function updateSuggestions() {
   box.innerHTML = '';
   const pseudo = { id: dialogShift?.id || '·new·', date: f.date.value, pos: f.pos.value.trim(), site: f.site.value.trim(), start: f.start.value, end: f.end.value };
   if (!pseudo.date || !pseudo.site) return;
+  if (pseudo.date < TODAY) {
+    box.append(el('div', 'pastwarn', `⚠ ${fmtDate(pseudo.date)} is in the past — filling it fixes the record, but it won't help upcoming coverage.`));
+  }
   const cands = suggestFor(pseudo, 8);
   if (!cands.length) return;
   const need = slotRole(pseudo.pos);
@@ -4357,12 +4393,20 @@ function wireDialog() {
   $('#cancelBtn').onclick = () => dlg.close();
   for (const name of ['date', 'pos', 'site', 'start', 'end']) f[name].onchange = updateSuggestions;
   $('#deleteShiftBtn').onclick = () => {
-    if (dialogShift && confirm('Remove this shift (as a draft change)?')) {
-      draftRemove(dialogShift);
-      audit(`Draft: removed ${describeShift(dialogShift)} (${dialogShift.who || 'OPEN'})`, 'edit');
-      dlg.close();
-      render();
-    }
+    if (!dialogShift) return;
+    const target = dialogShift;
+    confirmModal({
+      title: 'Remove this shift?',
+      body: `${describeShift(target)} (${target.who || 'OPEN'}) — staged as a draft change; staff see nothing until you publish.`,
+      confirmLabel: 'Remove as draft',
+      danger: true,
+      onConfirm: () => {
+        draftRemove(target);
+        audit(`Draft: removed ${describeShift(target)} (${target.who || 'OPEN'})`, 'edit');
+        dlg.close();
+        render();
+      },
+    });
   };
   f.onsubmit = () => {
     const fields = {
@@ -4585,25 +4629,43 @@ function wireChrome() {
   });
   $('#publishBtn').onclick = () => {
     const n = draftCount();
-    if (confirm(`Publish ${n} draft change${n === 1 ? '' : 's'}? Everyone affected gets a notification in the employee app.`)) publishDraft();
+    confirmModal({
+      title: `Publish ${n} draft change${n === 1 ? '' : 's'}?`,
+      body: 'Everyone affected gets a notification in the employee app.',
+      confirmLabel: 'Publish & notify',
+      onConfirm: publishDraft,
+    });
   };
   $('#discardDraftBtn').onclick = () => {
     const n = draftCount();
-    if (!confirm(`Throw away ${n} draft change${n === 1 ? '' : 's'}? The published schedule is untouched.`)) return;
-    overlay.adminDraft = { edits: {}, added: [], removed: [] };
-    audit(`Discarded ${n} draft change${n === 1 ? '' : 's'}`, 'denial');
-    saveOverlay();
-    render();
+    confirmModal({
+      title: `Throw away ${n} draft change${n === 1 ? '' : 's'}?`,
+      body: 'The published schedule is untouched.',
+      confirmLabel: 'Discard drafts',
+      danger: true,
+      onConfirm: () => {
+        overlay.adminDraft = { edits: {}, added: [], removed: [] };
+        audit(`Discarded ${n} draft change${n === 1 ? '' : 's'}`, 'denial');
+        saveOverlay();
+        render();
+      },
+    });
   };
   $('#exportJsonBtn').onclick = () => {
     download('shiftboard-data.json', JSON.stringify({ shifts: adminShifts().map(s => [s.date, s.pos, s.start, s.end, s.who || null, s.site || null, s.note || null, s.id]) }, null, 1), 'application/json');
   };
   $('#resetBtn').onclick = () => {
-    if (confirm('Discard ALL local demo changes — approvals, drafts, staff submissions, messages, and the audit log — and return to the imported schedule?')) {
-      overlay = EMPTY_OVERLAY();
-      saveOverlay();
-      render();
-    }
+    confirmModal({
+      title: 'Discard ALL local demo changes?',
+      body: 'Approvals, drafts, staff submissions, messages, and the audit log are removed and the imported schedule comes back.',
+      confirmLabel: 'Discard everything',
+      danger: true,
+      onConfirm: () => {
+        overlay = EMPTY_OVERLAY();
+        saveOverlay();
+        render();
+      },
+    });
   };
 }
 

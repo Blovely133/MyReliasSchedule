@@ -341,6 +341,12 @@ function addProviderRoleClass(node, role) {
   if (role) node.classList.add('role-' + role.toLowerCase());
 }
 
+/* people tagged "(deleted)" in the W2W export keep their historical shifts
+   on the calendars but stay out of pickers and the directory */
+function isDeletedName(n) {
+  return /\(deleted\)\s*$/i.test(n || '');
+}
+
 /* ---------- filter bar ---------- */
 
 function monthList() {
@@ -402,7 +408,7 @@ function renderFilterBar() {
     ws.append(o);
   }
   const va = $('#viewAsSelect');
-  const people = [...new Set(base.map(s => s.who).filter(Boolean))].sort();
+  const people = [...new Set(base.map(s => s.who).filter(Boolean))].filter(n => !isDeletedName(n)).sort();
   va.innerHTML = '<option value="">Everyone (full schedule)</option>';
   for (const p of people) {
     const o = el('option', '', p);
@@ -1073,11 +1079,21 @@ function renderPrefs(main) {
       const scheduled = shifts().some(s => s.who === mine && s.date === iso);
       if (scheduled) td.append(el('span', 'prefsched', isPhone() ? 'sched' : 'scheduled'));
       td.classList.add('clickable');
-      td.onclick = () => {
+      /* keyboard access: cells act as buttons, focus survives the re-render */
+      td.tabIndex = 0;
+      td.setAttribute('role', 'button');
+      td.dataset.iso = iso;
+      td.setAttribute('aria-label', `${fmtDateLong(iso)} — ${v ? PREF_LABEL[v].replace(/^[^\w]+/, '') : 'no preference'}. Press to cycle.`);
+      const cycle = () => {
         const next = PREF_CYCLE[(PREF_CYCLE.indexOf(v) + 1) % PREF_CYCLE.length];
         if (next) prefs[mine][iso] = next; else delete prefs[mine][iso];
         saveOverlay();
         render();
+        document.querySelector(`td[data-iso="${iso}"]`)?.focus();
+      };
+      td.onclick = cycle;
+      td.onkeydown = e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); cycle(); }
       };
     } else {
       for (const p of monthPrefs.filter(p => p.iso === iso)) {
@@ -1524,7 +1540,7 @@ function renderPeople(main) {
     if (s.date >= TODAY && (!p.next || s.date < p.next)) p.next = s.date;
   }
   const q = state.search.toLowerCase();
-  const names = [...map.keys()].filter(n => !q || n.toLowerCase().includes(q)).sort();
+  const names = [...map.keys()].filter(n => !isDeletedName(n) && (!q || n.toLowerCase().includes(q))).sort();
   $('#weekStats').textContent = `${names.length} people`;
 
   const table = el('table', 'flat');
