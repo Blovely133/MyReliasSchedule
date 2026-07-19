@@ -1277,9 +1277,29 @@ function requestsFor(site, mo) {
       const e = ensure(a.who);
       e.cap = a.value;
       if (e.source === 'submitted') e.source = 'assistant';
+    } else if (a.kind === 'setRequest' && a.mo === mo) {
+      /* authoritative record from the requests editor — replaces this person's
+         off/prefer/cap for the month */
+      const e = ensure(a.who);
+      e.off = new Set(a.off || []);
+      e.prefer = new Set(a.prefer || []);
+      e.cap = a.cap || null;
+      if (a.note !== undefined) e.note = a.note;
+      e.source = 'edited';
     }
   }
   return map;
+}
+
+/* drop prior request ops for a person+month so the editor's save is a clean replace */
+function clearPersonRequestOps(who, site, mo) {
+  overlay.genAdjust = (overlay.genAdjust || []).filter(a => {
+    if (a.who !== who || a.site !== site) return true;
+    if (a.kind === 'setRequest') return a.mo !== mo;
+    if (a.kind === 'setCap') return false;
+    if (a.kind === 'addOff' || a.kind === 'addPrefer') return !(a.dates || []).some(d => d.startsWith(mo));
+    return true;
+  });
 }
 
 /* average distinct days/month each provider worked at `site` over the recent
@@ -1730,6 +1750,256 @@ function renderScheduleChat(wrap) {
   });
 }
 
+/* ---------- requests editor + rules dialogs ---------- */
+
+function cardHeader(box, title, btnLabel, onClick) {
+  const head = el('div', 'cardhead');
+  head.append(el('h2', '', title));
+  if (btnLabel) {
+    const b = el('button', 'cardheadbtn', btnLabel);
+    b.type = 'button';
+    b.onclick = onClick;
+    head.append(b);
+  }
+  box.append(head);
+}
+
+function openModal(cls, build) {
+  const dlg = document.createElement('dialog');
+  dlg.className = 'gen-modal ' + (cls || '');
+  const body = el('div');
+  dlg.append(body);
+  document.body.append(dlg);
+  const cleanup = () => { if (dlg.parentNode) dlg.remove(); };
+  dlg.addEventListener('close', cleanup);   // Escape key closes → clean up too
+  const close = () => { dlg.close(); cleanup(); };
+  build(body, close);
+  dlg.showModal();
+  return { dlg, body, close };
+}
+
+/* enter / modify a single provider's requests on a clickable month calendar */
+function openRequestEditor(initialWho) {
+  const g = state.gen;
+  const site = g.site, mo = g.month;
+  const pool = poolFor(site, mo);
+  if (!pool.length) { alert('No providers in this site pool yet.'); return; }
+  const edit = { who: initialWho || pool[0].who, off: new Set(), prefer: new Set(), cap: '', note: '' };
+
+  function load(who) {
+    const r = requestsFor(site, mo).get(who);
+    edit.who = who;
+    edit.off = new Set([...(r?.off || [])].filter(d => d.startsWith(mo)));
+    edit.prefer = new Set([...(r?.prefer || [])].filter(d => d.startsWith(mo)));
+    edit.cap = r?.cap || '';
+    edit.note = r?.note || '';
+  }
+  load(edit.who);
+
+  const modal = openModal('req-modal', (body, close) => {
+    function paint() {
+      body.innerHTML = '';
+      body.append(el('h2', '', `Requests — ${siteName(site)}, ${fmtMonth(mo)}`));
+
+      const picker = el('label', 'modal-field', 'Provider ');
+      const sel = document.createElement('select');
+      for (const p of [...pool].sort((a, b) => a.who.localeCompare(b.who))) {
+        const o = el('option', '', `${p.who}${p.float ? ' (float)' : ''}`);
+        o.value = p.who;
+        if (p.who === edit.who) o.selected = true;
+        sel.append(o);
+      }
+      sel.onchange = () => { load(sel.value); paint(); };
+      picker.append(sel);
+      body.append(picker);
+
+      const legend = el('div', 'preflegend');
+      legend.append(el('span', 'prefchip pref-like', '✓ prefers to work'));
+      legend.append(el('span', 'prefchip pref-no', '✕ unavailable'));
+      legend.append(el('span', '', 'Click a day to cycle: prefer → unavailable → clear.'));
+      body.append(legend);
+
+      const [y, m] = mo.split('-').map(Number);
+      const table = el('table', 'reqcal');
+      const hr = el('tr');
+      for (const d of ['S', 'M', 'T', 'W', 'T', 'F', 'S']) hr.append(el('th', '', d));
+      table.append(hr);
+      const first = new Date(Date.UTC(y, m - 1, 1));
+      const daysIn = new Date(y, m, 0).getDate();
+      let tr = el('tr');
+      for (let i = 0; i < first.getUTCDay(); i++) tr.append(el('td', 'off'));
+      for (let day = 1; day <= daysIn; day++) {
+        const iso = `${mo}-${String(day).padStart(2, '0')}`;
+        const on = edit.off.has(iso), pf = edit.prefer.has(iso);
+        const td = el('td', 'reqcell' + (on ? ' cell-off' : pf ? ' cell-prefer' : ''), String(day));
+        td.onclick = () => {
+          if (edit.prefer.has(iso)) { edit.prefer.delete(iso); edit.off.add(iso); }
+          else if (edit.off.has(iso)) { edit.off.delete(iso); }
+          else { edit.prefer.add(iso); }
+          paint();
+        };
+        tr.append(td);
+        if ((first.getUTCDay() + day) % 7 === 0) { table.append(tr); tr = el('tr'); }
+      }
+      if (tr.children.length) { while (tr.children.length < 7) tr.append(el('td', 'off')); table.append(tr); }
+      body.append(table);
+
+      const capField = el('label', 'modal-field', 'Max shifts this month (optional) ');
+      const capInp = document.createElement('input');
+      capInp.type = 'number'; capInp.min = '0'; capInp.max = '31';
+      capInp.value = edit.cap;
+      capInp.placeholder = 'no cap';
+      capInp.oninput = () => { edit.cap = capInp.value; };
+      capField.append(capInp);
+      body.append(capField);
+
+      const noteField = el('label', 'modal-field', 'Note (optional) ');
+      const noteInp = document.createElement('input');
+      noteInp.type = 'text';
+      noteInp.value = edit.note;
+      noteInp.placeholder = 'e.g. "prefers Zone B", "wedding weekend"';
+      noteInp.oninput = () => { edit.note = noteInp.value; };
+      noteField.append(noteInp);
+      body.append(noteField);
+
+      const summary = el('div', 'reqhint', `${edit.prefer.size} preferred · ${edit.off.size} unavailable${edit.cap ? ` · cap ${edit.cap}` : ''}`);
+      body.append(summary);
+
+      const actions = el('div', 'dialog-actions');
+      const clearBtn = el('button', '', 'Clear all for this person');
+      clearBtn.type = 'button';
+      clearBtn.onclick = () => { edit.off = new Set(); edit.prefer = new Set(); edit.cap = ''; edit.note = ''; paint(); };
+      actions.append(clearBtn, el('span', 'spacer'));
+      const cancel = el('button', '', 'Cancel');
+      cancel.type = 'button';
+      cancel.onclick = close;
+      const save = el('button', 'primary', 'Save requests');
+      save.type = 'button';
+      save.onclick = () => {
+        clearPersonRequestOps(edit.who, site, mo);
+        const off = [...edit.off].sort(), prefer = [...edit.prefer].sort();
+        const cap = edit.cap ? Number(edit.cap) : null;
+        addAdjust('setRequest', { who: edit.who, mo, off, prefer, cap, note: edit.note.trim() },
+          `${edit.who.replace(/,.*$/, '')} requests set (${off.length} off · ${prefer.length} prefer${cap ? ` · cap ${cap}` : ''})`, site);
+        audit(`Requests editor: set ${edit.who} for ${fmtMonth(mo)} — ${off.length} off, ${prefer.length} prefer${cap ? `, cap ${cap}` : ''}`, 'ai');
+        if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+        saveOverlay();
+        close();
+        render();
+      };
+      actions.append(cancel, save);
+      body.append(actions);
+    }
+    paint();
+  });
+  return modal;
+}
+
+/* quick structured rules — global + per-provider */
+function openRulesDialog() {
+  const g = state.gen;
+  const site = g.site, mo = g.month;
+  openModal('rules-modal', (body, close) => {
+    function paint() {
+      body.innerHTML = '';
+      body.append(el('h2', '', `Rules — ${siteName(site)}, ${fmtMonth(mo)}`));
+
+      /* global: max consecutive days */
+      const g1 = el('div', 'rulegroup');
+      g1.append(el('h3', '', 'Global rule'));
+      const r1 = el('div', 'reqrow');
+      const curMax = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+      const maxLab = el('label', '', 'No more than ');
+      const maxInp = document.createElement('input');
+      maxInp.type = 'number'; maxInp.min = '1'; maxInp.max = '14'; maxInp.value = curMax;
+      maxInp.className = 'rulenum';
+      maxLab.append(maxInp, document.createTextNode(' days in a row (everyone, all sites)'));
+      const maxBtn = el('button', 'primary', 'Set');
+      maxBtn.type = 'button';
+      maxBtn.onclick = () => {
+        const n = Number(maxInp.value);
+        if (!n) return;
+        overlay.genAdjust = overlay.genAdjust.filter(a => a.kind !== 'maxRun');
+        addAdjust('maxRun', { value: n }, `max ${n} in a row (all sites)`, '*');
+        audit(`Rules dialog: max ${n} consecutive days`, 'ai');
+        if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+        saveOverlay();
+        paint();
+      };
+      r1.append(maxLab, maxBtn);
+      g1.append(r1);
+      body.append(g1);
+
+      /* per-provider rule */
+      const g2 = el('div', 'rulegroup');
+      g2.append(el('h3', '', 'Provider rule'));
+      const r2 = el('div', 'reqrow');
+      const pool = poolFor(site, mo);
+      const pSel = document.createElement('select');
+      for (const p of [...pool].sort((a, b) => a.who.localeCompare(b.who))) {
+        const o = el('option', '', p.who); o.value = p.who; pSel.append(o);
+      }
+      const kSel = document.createElement('select');
+      for (const [v, label] of [['night', 'nights only'], ['day', 'days only'], ['eve', 'evenings only'], ['cap', 'cap at…'], ['target', 'target…'], ['remove', 'remove from schedule']]) {
+        const o = el('option', '', label); o.value = v; kSel.append(o);
+      }
+      const vInp = document.createElement('input');
+      vInp.type = 'number'; vInp.min = '1'; vInp.max = '31'; vInp.value = '10'; vInp.className = 'rulenum';
+      const syncV = () => { vInp.style.display = (kSel.value === 'cap' || kSel.value === 'target') ? '' : 'none'; };
+      kSel.onchange = syncV; syncV();
+      const applyBtn = el('button', 'primary', 'Apply');
+      applyBtn.type = 'button';
+      applyBtn.onclick = () => {
+        const who = pSel.value, kind = kSel.value, n = Number(vInp.value);
+        const first = who.replace(/,.*$/, '');
+        if (kind === 'remove') { addAdjust('removeProvider', { who }, `${first} removed`, site); audit(`Rules dialog: removed ${who}`, 'ai'); }
+        else if (kind === 'cap') { addAdjust('setCap', { who, value: n }, `${first} capped at ${n}`, site); audit(`Rules dialog: capped ${who} at ${n}`, 'ai'); }
+        else if (kind === 'target') { addAdjust('setTarget', { who, value: n }, `${first} target ${n}/mo`, site); audit(`Rules dialog: ${who} target ${n}`, 'ai'); }
+        else { addAdjust('setTimeOfDay', { who, tod: kind }, `${first} → ${kind}s only`, site); audit(`Rules dialog: ${who} ${kind} only`, 'ai'); }
+        if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+        saveOverlay();
+        paint();
+      };
+      r2.append(pSel, kSel, vInp, applyBtn);
+      g2.append(r2);
+      body.append(g2);
+
+      /* active rules with remove */
+      const active = (overlay.genAdjust || []).filter(a => (a.site === site || a.site === '*') && ['maxRun', 'setTimeOfDay', 'setCap', 'setTarget', 'removeProvider', 'addProvider'].includes(a.kind));
+      const listBox = el('div', 'rulegroup');
+      listBox.append(el('h3', '', `Active rules (${active.length})`));
+      if (!active.length) listBox.append(el('div', 'reqhint', 'No rules yet. Day-off and preference requests live in the requests editor; this dialog is for hard rules.'));
+      else {
+        const chips = el('div', 'adjrow');
+        for (const a of active) {
+          const chip = el('span', 'adjchip', a.summary);
+          const x = el('button', 'adjx', '✕');
+          x.type = 'button';
+          x.onclick = () => {
+            overlay.genAdjust = overlay.genAdjust.filter(z => z.id !== a.id);
+            if (g.result) { g.result = runGeneration(site, mo); g.applied = false; }
+            saveOverlay();
+            paint();
+          };
+          chip.append(x);
+          chips.append(chip);
+        }
+        listBox.append(chips);
+      }
+      body.append(listBox);
+
+      const actions = el('div', 'dialog-actions');
+      actions.append(el('span', 'spacer'));
+      const done = el('button', 'primary', 'Done');
+      done.type = 'button';
+      done.onclick = () => { close(); render(); };
+      actions.append(done);
+      body.append(actions);
+    }
+    paint();
+  });
+}
+
 /* ---------- generate view ---------- */
 
 /* month-calendar preview of a generated proposal (read-only) */
@@ -1870,18 +2140,26 @@ function renderGenerate(main) {
   const poolNames = new Set(poolFor(g.site, g.month).map(p => p.who));
   const visibleReqs = [...reqs.values()].filter(r => poolNames.has(r.who) || r.source === 'example');
   const reqBox = el('div', 'reqform');
-  reqBox.append(el('h2', '', `Requests on file — ${siteName(g.site)}, ${fmtMonth(g.month)} (${visibleReqs.length})`));
+  cardHeader(reqBox, `Requests on file — ${siteName(g.site)}, ${fmtMonth(g.month)} (${visibleReqs.length})`,
+    '✎ Enter / modify requests', () => openRequestEditor());
   if (!visibleReqs.length) {
-    reqBox.append(el('div', 'approval-empty', 'Nothing on file for this site/month. Staff submit via the employee app (Requests tab); example request lists are seeded for NMMC-Tupelo ★ and DCH-Northport ★ in September.'));
+    reqBox.append(el('div', 'approval-empty', 'Nothing on file for this site/month. Use “Enter / modify requests” to add them here, or staff submit via the employee app. Example lists are seeded for NMMC-Tupelo ★ and DCH-Northport ★ in September.'));
   } else {
     const table = el('table', 'flat');
     table.innerHTML = '<thead><tr><th>Provider</th><th>Source</th><th>Requests</th></tr></thead>';
     const tb = el('tbody');
     for (const r of visibleReqs.sort((a, b) => a.who.localeCompare(b.who))) {
       const tr = el('tr');
-      tr.append(el('td', '', r.who));
+      const tdName = el('td');
+      const link = el('a', '', r.who);
+      link.href = '#';
+      link.title = 'Edit this provider’s requests';
+      link.onclick = e => { e.preventDefault(); openRequestEditor(r.who); };
+      tdName.append(link);
+      tr.append(tdName);
       const tdS = el('td');
-      tdS.append(el('span', 'srcpill src-' + r.source, r.source === 'example' ? 'example' : 'submitted in-app'));
+      const srcLabel = { example: 'example', assistant: 'assistant', edited: 'edited', submitted: 'submitted in-app' }[r.source] || r.source;
+      tdS.append(el('span', 'srcpill src-' + r.source, srcLabel));
       tr.append(tdS);
       const parts = [];
       if (r.off.size) parts.push(`off: ${moShort(g.month)} ${fmtDayRanges(g.month, r.off)}`);
@@ -1912,7 +2190,7 @@ function renderGenerate(main) {
 
     /* AI notes */
     const notesBox = el('div', 'reqform');
-    notesBox.append(el('h2', '', 'AI notes on this proposal'));
+    cardHeader(notesBox, 'AI notes on this proposal', '＋ Add rule', () => openRulesDialog());
     const ul = el('ul', 'ainotes');
     const bullet = t => ul.append(el('li', '', t));
     bullet(`Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
