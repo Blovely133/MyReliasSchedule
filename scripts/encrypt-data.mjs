@@ -5,8 +5,10 @@ import { resolve } from 'node:path';
 const pin = process.env.MY_RELIAS_PIN;
 if (!pin) throw new Error('Set MY_RELIAS_PIN before running this script.');
 
+/* optional argv: output path — lets us publish a second copy under the
+   scheduler PIN (e.g. node scripts/encrypt-data.mjs data/schedule-data.admin.enc.json) */
 const inputPath = resolve('data/schedule-data.json');
-const outputPath = resolve('data/schedule-data.enc.json');
+const outputPath = resolve(process.argv[2] || 'data/schedule-data.enc.json');
 const clear = await readFile(inputPath);
 const salt = randomBytes(16);
 const iv = randomBytes(12);

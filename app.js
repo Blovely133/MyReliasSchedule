@@ -9,7 +9,10 @@ const TODAY = (() => {
 })();
 
 let base = [];          // [{id,date,pos,start,end,who,site,note}]
-let overlay = { edits: {}, added: [], removed: [], requests: [], contacts: {}, messages: [], trades: [], prefs: {}, notifs: [], reqSubmissions: [] };
+/* full overlay shape — includes the scheduler console's keys (adminDraft, audit)
+   so saves/resets from either surface never drop the other's data */
+const DEFAULT_OVERLAY = () => ({ edits: {}, added: [], removed: [], requests: [], contacts: {}, messages: [], trades: [], prefs: {}, notifs: [], reqSubmissions: [], adminDraft: { edits: {}, added: [], removed: [] }, audit: [] });
+let overlay = DEFAULT_OVERLAY();
 let state = {
   view: 'month',
   weekStart: null,      // ISO date of a Sunday
@@ -138,7 +141,7 @@ async function loadData(pin) {
     s.site = Object.entries(posSite[s.pos]).sort((a, b) => b[1] - a[1])[0][0];
   }
   $('#dataNote').textContent = `Imported from WhenToWork · ${fmtDate(raw.range[0])} – ${fmtDate(raw.range[1])}`;
-  try { overlay = { ...overlay, ...JSON.parse(localStorage.getItem(LS_KEY) || '{}') }; } catch {}
+  try { overlay = { ...DEFAULT_OVERLAY(), ...JSON.parse(localStorage.getItem(LS_KEY) || '{}') }; } catch {}
   if (!overlay.requests) overlay.requests = [];
   if (!overlay.contacts) overlay.contacts = {};
   if (!overlay.messages) overlay.messages = [];
@@ -1658,14 +1661,14 @@ function wireChrome() {
         date: s[0], pos: s[1], start: s[2], end: s[3],
         who: s[4] || '', site: s[5] || '', note: s[6] || '',
       }));
-      overlay = { edits: {}, added: [], removed: [] };
+      overlay = DEFAULT_OVERLAY();
       saveOverlay();
       render();
     } catch (err) { alert('Could not read that file: ' + err.message); }
   };
   $('#resetBtn').onclick = () => {
     if (confirm('Discard all local changes and return to the imported schedule?')) {
-      overlay = { edits: {}, added: [], removed: [] };
+      overlay = DEFAULT_OVERLAY();
       saveOverlay();
       render();
     }
@@ -1759,4 +1762,10 @@ function render() {
   wireDialog();
   wirePersonDialog();
   render();
+  /* live cross-tab sync: scheduler-console actions appear here without a refresh */
+  window.addEventListener('storage', e => {
+    if (e.key !== LS_KEY) return;
+    try { overlay = { ...DEFAULT_OVERLAY(), ...JSON.parse(e.newValue || '{}') }; } catch { return; }
+    render();
+  });
 })();

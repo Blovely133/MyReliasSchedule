@@ -19,9 +19,25 @@ The published app loads an AES-GCM encrypted schedule after the shared PIN is
 entered. The four-digit PIN is a lightweight prototype deterrent, not production
 authentication. Raw schedule imports are intentionally excluded from Git.
 
+Two surfaces, two PINs:
+
+- `index.html` — **employee prototype** (shared staff PIN)
+- `admin.html` — **scheduler console** (separate scheduler PIN; amber-accented).
+  Approvals inbox with conflict checks, a coverage/gaps board with fair-fill
+  suggestions, a schedule builder with a draft → publish workflow (staff are
+  notified on publish), fairness/wellness reports, and an audit trail. Both
+  surfaces share the same browser-local overlay, so employee submissions land
+  in the console live (open them side-by-side in two windows for the full demo).
+
+To (re)encrypt after changing data or PINs:
+
+    $env:MY_RELIAS_PIN='<employee pin>'; node scripts/encrypt-data.mjs
+    $env:MY_RELIAS_PIN='<scheduler pin>'; node scripts/encrypt-data.mjs data/schedule-data.admin.enc.json
+
 ## What's here
 
-- `index.html` / `styles.css` / `app.js` — the app (vanilla JS, no dependencies)
+- `index.html` / `styles.css` / `app.js` — the employee app (vanilla JS, no dependencies)
+- `admin.html` / `admin.css` / `admin.js` — the scheduler console (same stack)
 - `data/schedule-data.json` — combined import; rows are
   `[date, position, start, end, name, site, note, w2wShiftId]`
 - `data/week-*.json` — raw per-week pulls from WhenToWork

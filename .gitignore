@@ -1,6 +1,7 @@
 # Raw personnel schedule imports stay out of the public repository.
 data/*.json
 !data/schedule-data.enc.json
+!data/schedule-data.admin.enc.json
 data/save-week.ps1
 
 # Local OS/editor noise.
