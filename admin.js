@@ -29,6 +29,7 @@ let state = {
   focusDay: null,       // set by a coverage-cell click; highlighted in the Builder grid
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
+  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false },
 };
 
 /* Site codes → full facility names, from WhenToWork's category list */
@@ -120,7 +121,26 @@ async function loadData(pin) {
     if (s.site || !posSite[s.pos]) continue;
     s.site = Object.entries(posSite[s.pos]).sort((a, b) => b[1] - a[1])[0][0];
   }
-  $('#dataNote').textContent = `Imported from WhenToWork · ${fmtDate(raw.range[0])} – ${fmtDate(raw.range[1])}`;
+  /* Tupelo's zone positions are almost entirely unassigned in W2W, so the
+     assignment-based inference misses them — tag them by position name */
+  for (const s of base) if (!s.site && /tupelo|\btup\b/i.test(s.pos)) s.site = 'TUP';
+
+  /* forecast scaffold: Sep–Dec mirror August's per-site slot pattern as
+     UNFILLED slots (admin console only — staff see future months once the
+     scheduler publishes assignments) */
+  const FORECAST_MONTHS = ['2026-09', '2026-10', '2026-11', '2026-12'];
+  const template = base.filter(s => s.site && s.date.startsWith('2026-08'));
+  const aSrc = sundayOf('2026-08-01');
+  let fseq = 0;
+  for (const mo of FORECAST_MONTHS) {
+    const aDst = sundayOf(mo + '-01');
+    for (const t of template) {
+      const date = addDays(aDst, Math.round((Date.parse(t.date) - Date.parse(aSrc)) / 86400000));
+      if (!date.startsWith(mo)) continue;
+      base.push({ id: 'f' + (fseq++), date, pos: t.pos, start: t.start, end: t.end, who: '', site: t.site, note: '', forecast: true });
+    }
+  }
+  $('#dataNote').textContent = `Imported from WhenToWork · ${fmtDate(raw.range[0])} – ${fmtDate(raw.range[1])} · unfilled forecast to Dec`;
   readOverlayFromStorage();
 }
 
@@ -1080,6 +1100,453 @@ function renderAudit(main) {
   main.append(box);
 }
 
+/* ---------- AI schedule generation ----------
+   The reconciliation engine runs live in the browser (deterministic greedy
+   with hard rules + scoring). Example request lists are seeded for NMMC-Tupelo
+   and DCH-Northport; anything staff submit in the employee app merges in. */
+
+const EXAMPLE_SCHEDULING = {
+  TUP: {
+    month: '2026-09',
+    /* [who, role, monthly target, float pool?] — regulars are Tupelo's own
+       providers from the W2W import; floats are real NMMC-network providers */
+    pool: [
+      ['Cole Young, MD', 'PHY', 14, 0], ['Misty Rea, MD', 'PHY', 13, 0], ['Kirti Patel, MD', 'PHY', 13, 0],
+      ['Kristin Mitchell, MD', 'PHY', 12, 0], ['Shayna Thompson, MD', 'PHY', 12, 0], ['Joe Johnsey, MD', 'PHY', 12, 0],
+      ['Scotty Reed, MD', 'PHY', 12, 0], ['Lindsie Story, PA-C', 'APC', 13, 0], ['Renee Mitchell, NP', 'APC', 12, 0],
+      ['Travis Anderson, MD', 'PHY', 5, 1], ['Yusef Hamid, MD', 'PHY', 5, 1], ['Seth Cappleman, DO', 'PHY', 5, 1],
+      ['Adeniyi Koiki, MD', 'PHY', 4, 1], ['Brad Bowlin, MD', 'PHY', 4, 1], ['Mai Huu Ho, MD', 'PHY', 4, 1],
+      ['Janice Mitchell, DO', 'PHY', 4, 1], ['Ridge Dabbs, DO', 'PHY', 4, 1], ['Brian McCoy, MD', 'PHY', 4, 1],
+      ['Marcus Crittenden, MD', 'PHY', 4, 1],
+      ['Josh Strickland, PA-C', 'APC', 5, 1], ['Wesley Estock, PA-C', 'APC', 5, 1], ['Katie McClain, NP', 'APC', 4, 1],
+      ['Taylor Brezinka, PA-C', 'APC', 4, 1], ['Rachel Rolison, NP', 'APC', 4, 1], ['Lane Hunt, NP', 'APC', 4, 1],
+    ],
+    requests: [
+      { who: 'Cole Young, MD', off: [1, 2, 3, 4, 5], prefer: [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24], note: 'Family vacation first week' },
+      { who: 'Misty Rea, MD', off: [19, 20], cap: 12, note: 'Wedding weekend' },
+      { who: 'Kirti Patel, MD', off: [25, 26, 27, 28, 29, 30], prefer: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], note: 'Conference end of month' },
+      { who: 'Kristin Mitchell, MD', off: [6, 13, 20, 27], note: 'No Sundays (childcare)' },
+      { who: 'Shayna Thompson, MD', prefer: [5, 6, 12, 13, 19, 20, 26, 27], note: 'Prefers weekends' },
+      { who: 'Joe Johnsey, MD', off: [8, 9, 10, 11, 12, 13, 14], note: 'Out of town' },
+      { who: 'Lindsie Story, PA-C', prefer: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30], cap: 12 },
+      { who: 'Renee Mitchell, NP', off: [1, 2, 29, 30] },
+      { who: 'Scotty Reed, MD', note: 'Prefers Zone B assignments when possible' },
+    ],
+  },
+  NOR: {
+    month: '2026-09',
+    pool: [
+      ['Alisa Johnson, MD', 'PHY', 12, 0], ['Abigail Halleron, MD', 'PHY', 11, 0], ['Blake Lovely, MD', 'PHY', 10, 0],
+      ['Kenneth Akalonu, MD', 'PHY', 9, 0], ['Jimmy Tu, MD', 'PHY', 7, 0], ['Temar Elsayed, MD', 'PHY', 7, 0],
+      ['Ifeoma Kamalu, MD', 'PHY', 5, 0], ['Nathan Hadley, MD', 'PHY', 4, 0], ['George Petty, MD', 'PHY', 3, 0],
+      ['Kimberly Buck, NP', 'APC', 11, 0], ['Yancy Beard, CRNP', 'APC', 10, 0], ['Brooke Palmer, NP', 'APC', 10, 0],
+      ['Kayela Norris, PA', 'APC', 10, 0], ['Amanda Smith, NP', 'APC', 10, 0], ['Emily Stuart, NP', 'APC', 10, 0],
+      ['Kelsey Galloway, NP', 'APC', 9, 0], ['Beth Dunn, NP', 'APC', 6, 0], ['Sarah Spencer, NP', 'APC', 4, 0],
+      ['Joshua Hood, NP', 'APC', 3, 0], ['Lauren Kyzar, NP', 'APC', 3, 0],
+    ],
+    requests: [
+      { who: 'Blake Lovely, MD', prefer: [1, 2, 3, 4, 14, 15, 16, 17, 26, 27, 28, 29], note: 'Night blocks, as usual' },
+      { who: 'Abigail Halleron, MD', off: [10, 11, 12, 13, 14, 15, 16], note: 'Vacation' },
+      { who: 'Jimmy Tu, MD', off: [5, 6], cap: 8 },
+      { who: 'Alisa Johnson, MD', prefer: [7, 8, 9, 10, 11, 12, 13] },
+      { who: 'Kimberly Buck, NP', off: [22, 23, 24, 25] },
+      { who: 'Ifeoma Kamalu, MD', cap: 6, note: 'Per diem — light month requested' },
+      { who: 'Temar Elsayed, MD', off: [1, 2, 3], prefer: [18, 19, 20, 21, 22, 23, 24] },
+      { who: 'Emily Stuart, NP', off: [2, 9, 16, 23, 30], note: 'Clinic day Wednesdays' },
+    ],
+  },
+};
+
+function slotRole(pos) {
+  if (/resident|student/i.test(pos)) return 'SKIP';
+  if (/apc|\bapp\b|midlevel|\bnp\b|\bpa\b|crnp/i.test(pos)) return 'APC';
+  if (/\bdr\b|doctor|physician|\bmd\b|hospitalist|nocturnist/i.test(pos)) return 'PHY';
+  return 'ANY';
+}
+
+const expandDays = (mo, nums) => (nums || []).map(n => `${mo}-${String(n).padStart(2, '0')}`);
+const moShort = mo => {
+  const [y, m] = mo.split('-').map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: 'short' });
+};
+
+function fmtDayRanges(mo, set) {
+  const days = [...set].filter(d => d.startsWith(mo)).map(d => Number(d.slice(8))).sort((a, b) => a - b);
+  const parts = [];
+  for (let i = 0; i < days.length;) {
+    let j = i;
+    while (j + 1 < days.length && days[j + 1] === days[j] + 1) j++;
+    parts.push(i === j ? String(days[i]) : days[i] + '–' + days[j]);
+    i = j + 1;
+  }
+  return parts.join(', ');
+}
+
+/* example requests + anything staff submitted in-app, merged per provider */
+function requestsFor(site, mo) {
+  const map = new Map();
+  const ensure = who => {
+    if (!map.has(who)) map.set(who, { who, off: new Set(), prefer: new Set(), cap: null, note: '', source: 'submitted' });
+    return map.get(who);
+  };
+  const ex = EXAMPLE_SCHEDULING[site];
+  if (ex && ex.month === mo) {
+    for (const r of ex.requests) {
+      const e = ensure(r.who);
+      e.source = 'example';
+      for (const d of expandDays(mo, r.off)) e.off.add(d);
+      for (const d of expandDays(mo, r.prefer)) e.prefer.add(d);
+      if (r.cap) e.cap = r.cap;
+      if (r.note) e.note = r.note;
+    }
+  }
+  for (const [name, days] of Object.entries(overlay.prefs || {})) {
+    const off = Object.keys(days).filter(iso => iso.startsWith(mo) && days[iso] === 'no');
+    const like = Object.keys(days).filter(iso => iso.startsWith(mo) && days[iso] === 'like');
+    if (!off.length && !like.length) continue;
+    const e = ensure(name);
+    for (const iso of off) e.off.add(iso);
+    for (const iso of like) e.prefer.add(iso);
+  }
+  return map;
+}
+
+function poolFor(site, mo) {
+  const ex = EXAMPLE_SCHEDULING[site];
+  if (ex && ex.month === mo) return ex.pool.map(([who, role, target, float]) => ({ who, role, target, float: !!float }));
+  /* other sites: derive the pool from who actually worked there in August */
+  const counts = {};
+  for (const s of base) {
+    if (s.forecast || s.site !== site || !s.who || !s.date.startsWith('2026-08')) continue;
+    counts[s.who] = (counts[s.who] || 0) + 1;
+  }
+  return Object.entries(counts).map(([who, n]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, n), float: false }));
+}
+
+function runGeneration(site, mo) {
+  const all = adminShifts();
+  const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && !s.who);
+  const slots = openHere.filter(s => slotRole(s.pos) !== 'SKIP')
+    .sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
+  const skipped = openHere.length - slots.length;
+  const pool = poolFor(site, mo);
+  const reqs = requestsFor(site, mo);
+  const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set() }]));
+  const overnights = new Map();
+  const markOvernight = (who, date) => {
+    if (!overnights.has(who)) overnights.set(who, new Set());
+    overnights.get(who).add(date);
+  };
+  for (const s of all) {
+    if (!s.who || !s.date.startsWith(mo)) continue;
+    const st = stats.get(s.who);
+    if (st) st.dates.add(s.date);
+    if (isOvernight(s)) markOvernight(s.who, s.date);
+  }
+  const assignments = [];
+  const unfilled = [];
+  const capsHit = new Set();
+  for (const slot of slots) {
+    const need = slotRole(slot.pos);
+    let best = null, bestScore = -Infinity;
+    for (const p of pool) {
+      if (need !== 'ANY' && p.role !== 'ANY' && p.role !== need) continue;
+      const st = stats.get(p.who);
+      const r = reqs.get(p.who);
+      if (r && r.off.has(slot.date)) continue;                                   // hard: unavailable
+      const cap = (r && r.cap) || p.target + 3;
+      if (st.assigned >= cap) { if (r && r.cap) capsHit.add(p.who); continue; }  // hard: shift cap
+      if (st.dates.has(slot.date)) continue;                                     // hard: one shift/day
+      if (slot.start < '12:00' && overnights.get(p.who)?.has(addDays(slot.date, -1))) continue;  // hard: rest after overnight
+      let run = 0;
+      for (let k = 1; k <= 5; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
+      if (run >= 5) continue;                                                    // hard: max 5 consecutive days
+      let score = 0;
+      if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
+      if (st.dates.has(addDays(slot.date, -1))) score += 45;                     // build blocks
+      score += p.float ? -8 : 12;                                                // regulars first
+      score -= (st.assigned / Math.max(1, p.target)) * 70;                       // balance load
+      if (score > bestScore) { best = p; bestScore = score; }
+    }
+    if (!best) { unfilled.push(slot); continue; }
+    const st = stats.get(best.who);
+    const r = reqs.get(best.who);
+    const preferred = !!(r && r.prefer.has(slot.date));
+    assignments.push({ slot, who: best.who, preferred });
+    st.assigned++;
+    if (preferred) st.preferGot++;
+    st.dates.add(slot.date);
+    if (isOvernight(slot)) markOvernight(best.who, slot.date);
+  }
+  for (const st of stats.values()) {
+    let bestRun = 0;
+    for (const d of st.dates) {
+      if (st.dates.has(addDays(d, -1))) continue;
+      let len = 1;
+      while (st.dates.has(addDays(d, len))) len++;
+      bestRun = Math.max(bestRun, len);
+    }
+    st.longestRun = bestRun;
+  }
+  const offDays = [...reqs.values()].reduce((a, r) => a + r.off.size, 0);
+  const preferTotal = [...reqs.values()].reduce((a, r) => a + r.prefer.size, 0);
+  const preferGot = [...stats.values()].reduce((a, s) => a + s.preferGot, 0);
+  return { site, mo, slots: slots.length, skipped, assignments, unfilled, stats, reqs, offDays, preferTotal, preferGot, capsHit: [...capsHit] };
+}
+
+function applyGeneration(gen) {
+  const d = overlay.adminDraft;
+  for (const a of gen.assignments) {
+    const s = a.slot;
+    if (s.forecast) {
+      /* forecast slots are admin-side scaffolding — publish real added shifts instead */
+      d.added.push({ id: nextAddId(), date: s.date, pos: s.pos, start: s.start, end: s.end, who: a.who, site: s.site, note: '' });
+      if (!d.removed.includes(s.id)) d.removed.push(s.id);
+    } else {
+      d.edits[s.id] = { ...(d.edits[s.id] || {}), who: a.who };
+    }
+  }
+  saveOverlay();
+  audit(`AI draft: filled ${gen.assignments.length} of ${gen.slots} ${fmtMonth(gen.mo)} slots at ${siteName(gen.site)} from ${gen.reqs.size} provider requests (${gen.unfilled.length} left open)`, 'ai');
+  render();
+}
+
+function stageGenerate() {
+  const g = state.gen;
+  g.running = true; g.result = null; g.applied = false; g.showEmails = false;
+  render();
+  const pool = poolFor(g.site, g.month);
+  const reqs = requestsFor(g.site, g.month);
+  const openCount = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
+  const steps = [
+    `Reading ${reqs.size} provider request${reqs.size === 1 ? '' : 's'}…`,
+    `Scoring ${openCount.toLocaleString()} open slots against ${pool.length} providers…`,
+    'Applying rest rules, shift caps, and block scheduling…',
+    'Balancing load and honoring preferences…',
+  ];
+  let i = 0;
+  const tick = () => {
+    const elx = document.getElementById('genStatus');
+    if (!elx) { g.running = false; return; }
+    if (i < steps.length) { elx.textContent = steps[i++]; setTimeout(tick, 700); }
+    else { g.result = runGeneration(g.site, g.month); g.running = false; render(); }
+  };
+  tick();
+}
+
+/* ---------- provider email previews ---------- */
+
+function emailAddress(who) {
+  const c = overlay.contacts[who];
+  if (c && c.email) return c.email;
+  return who.replace(/,.*$/, '').toLowerCase().replace(/[^a-z ]/g, '').trim().replace(/\s+/g, '.') + '@reliashealthcare.com';
+}
+
+function groupRuns(list) {
+  const out = [];
+  for (const s of list.slice().sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start))) {
+    const last = out[out.length - 1];
+    if (last && last.pos === s.pos && last.start === s.start && last.end === s.end && s.date === addDays(last.endDate, 1)) last.endDate = s.date;
+    else out.push({ startDate: s.date, endDate: s.date, pos: s.pos, start: s.start, end: s.end });
+  }
+  return out;
+}
+
+function scheduleEmail(gen, who) {
+  const first = who.replace(/,.*$/, '').split(' ')[0];
+  const mine = gen.assignments.filter(a => a.who === who).map(a => a.slot);
+  const lines = [`Hi ${first},`, '', `Your ${fmtMonth(gen.mo)} schedule at ${siteName(gen.site)} is ready — ${mine.length} shift${mine.length === 1 ? '' : 's'}:`, ''];
+  for (const r of groupRuns(mine)) {
+    lines.push(`  • ${fmtDate(r.startDate)}${r.endDate !== r.startDate ? `–${fmtDate(r.endDate)}` : ''} · ${r.start}–${r.end} · ${r.pos}`);
+  }
+  const req = gen.reqs.get(who);
+  if (req && req.off.size) lines.push('', `Your requested days off (${moShort(gen.mo)} ${fmtDayRanges(gen.mo, req.off)}) are fully protected.`);
+  if (req && req.prefer.size) lines.push(`We placed ${gen.stats.get(who)?.preferGot || 0} of your ${req.prefer.size} preferred days.`);
+  lines.push('', 'Need a change? Reply here, or use the swap board in MyReliasSchedule.', '', '— Relias Scheduling (drafted by AI, reviewed by your scheduler)');
+  return { to: emailAddress(who), subject: `Your ${fmtMonth(gen.mo)} schedule — ${siteName(gen.site)}`, body: lines.join('\n') };
+}
+
+function collectEmail(site, mo) {
+  return {
+    to: `every ${siteName(site)} provider (individually)`,
+    subject: `${fmtMonth(mo)} scheduling requests — reply by the 15th`,
+    body: `Hi Dr. —,\n\nWe're building the ${fmtMonth(mo)} schedule for ${siteName(site)}. Reply to this email with your requests, or tap your dates in MyReliasSchedule → Requests:\n\n  • Days you can't work\n  • Days you'd prefer to work\n  • A shift-count target, if any\n\nEverything received by the 15th is guaranteed consideration. Replies are read automatically and added to your request file.\n\n— Relias Scheduling (drafted by AI, reviewed by your scheduler)`,
+  };
+}
+
+/* ---------- generate view ---------- */
+
+function renderGenerate(main) {
+  const g = state.gen;
+  const months = ['2026-09', '2026-10', '2026-11', '2026-12'];
+  if (!months.includes(g.month)) g.month = months[0];
+  $('#weekStats').textContent = `${siteName(g.site)} · ${fmtMonth(g.month)}${g.result ? ` · proposal: ${g.result.assignments.length} of ${g.result.slots} slots filled` : ''}`;
+  const wrap = el('div', 'reqwrap');
+
+  const intro = el('div', 'reqform genintro');
+  intro.append(el('h2', '', '✨ AI schedule generation'));
+  intro.append(el('div', 'reqhint',
+    'Collect requests → reconcile → draft → publish. The reconciliation engine runs live in this browser — days off are never violated, caps and rest rules hold, blocks stay together, load balances. In production the same loop runs through Claude\'s API, including emailing providers to collect requests and sending everyone their schedule.'));
+  wrap.append(intro);
+
+  /* controls */
+  const ctrl = el('div', 'reqform');
+  const row = el('div', 'reqrow');
+  const siteSel = document.createElement('select');
+  for (const s of [...new Set(base.map(x => x.site).filter(Boolean))].sort((a, b) => siteName(a).localeCompare(siteName(b)))) {
+    const o = el('option', '', `${siteName(s)}${EXAMPLE_SCHEDULING[s] ? ' ★' : ''}`);
+    o.value = s;
+    if (s === g.site) o.selected = true;
+    siteSel.append(o);
+  }
+  siteSel.onchange = () => { g.site = siteSel.value; g.result = null; g.applied = false; g.showEmails = false; render(); };
+  const moSel = document.createElement('select');
+  for (const m of months) {
+    const o = el('option', '', fmtMonth(m));
+    o.value = m;
+    if (m === g.month) o.selected = true;
+    moSel.append(o);
+  }
+  moSel.onchange = () => { g.month = moSel.value; g.result = null; g.applied = false; g.showEmails = false; render(); };
+  const lb = (t, i) => { const l = el('label', '', t + ' '); l.append(i); return l; };
+  row.append(lb('Site (★ = example requests seeded)', siteSel), lb('Month', moSel));
+  const goBtn = el('button', 'primary genbtn', g.running ? 'Generating…' : '✨ Generate schedule');
+  goBtn.disabled = g.running;
+  goBtn.onclick = stageGenerate;
+  row.append(goBtn);
+  ctrl.append(row);
+  if (g.running) {
+    const st = el('div', 'genstatus', 'Starting…');
+    st.id = 'genStatus';
+    ctrl.append(st);
+  }
+  wrap.append(ctrl);
+
+  /* requests on file */
+  const reqs = requestsFor(g.site, g.month);
+  const poolNames = new Set(poolFor(g.site, g.month).map(p => p.who));
+  const visibleReqs = [...reqs.values()].filter(r => poolNames.has(r.who) || r.source === 'example');
+  const reqBox = el('div', 'reqform');
+  reqBox.append(el('h2', '', `Requests on file — ${siteName(g.site)}, ${fmtMonth(g.month)} (${visibleReqs.length})`));
+  if (!visibleReqs.length) {
+    reqBox.append(el('div', 'approval-empty', 'Nothing on file for this site/month. Staff submit via the employee app (Requests tab); example request lists are seeded for NMMC-Tupelo ★ and DCH-Northport ★ in September.'));
+  } else {
+    const table = el('table', 'flat');
+    table.innerHTML = '<thead><tr><th>Provider</th><th>Source</th><th>Requests</th></tr></thead>';
+    const tb = el('tbody');
+    for (const r of visibleReqs.sort((a, b) => a.who.localeCompare(b.who))) {
+      const tr = el('tr');
+      tr.append(el('td', '', r.who));
+      const tdS = el('td');
+      tdS.append(el('span', 'srcpill src-' + r.source, r.source === 'example' ? 'example' : 'submitted in-app'));
+      tr.append(tdS);
+      const parts = [];
+      if (r.off.size) parts.push(`off: ${moShort(g.month)} ${fmtDayRanges(g.month, r.off)}`);
+      if (r.prefer.size) parts.push(`prefers: ${moShort(g.month)} ${fmtDayRanges(g.month, r.prefer)}`);
+      if (r.cap) parts.push(`max ${r.cap} shifts`);
+      if (r.note) parts.push(`“${r.note}”`);
+      tr.append(el('td', '', parts.join(' · ') || '—'));
+      tb.append(tr);
+    }
+    table.append(tb);
+    reqBox.append(table);
+  }
+  wrap.append(reqBox);
+
+  /* results */
+  const res = g.result;
+  if (res) {
+    const kpis = el('div', 'kpirow');
+    const pct = res.slots ? Math.round(res.assignments.length / res.slots * 100) : 0;
+    kpis.append(kpi(`${pct}%`, `Slots filled (${res.assignments.length} of ${res.slots})`, pct >= 90 ? 'ok' : pct >= 60 ? '' : 'warn'));
+    kpis.append(kpi(res.unfilled.length, 'Still open', res.unfilled.length ? 'warn' : 'ok'));
+    kpis.append(kpi(res.offDays, 'Days-off honored (all of them)', 'ok'));
+    kpis.append(kpi(`${res.preferGot}/${res.preferTotal}`, 'Preferred days granted', ''));
+    wrap.append(kpis);
+
+    /* AI notes */
+    const notesBox = el('div', 'reqform');
+    notesBox.append(el('h2', '', 'AI notes on this proposal'));
+    const ul = el('ul', 'ainotes');
+    const bullet = t => ul.append(el('li', '', t));
+    bullet(`Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
+    if (res.unfilled.length > 15) bullet(`Coverage gap: roughly ${Math.ceil(res.unfilled.length / 13)} more full-time providers are needed to fully cover ${siteName(res.site)} — a concrete number for recruiting.`);
+    bullet(`Every requested day off was honored — the engine treats “unavailable” as a hard rule, never a suggestion.`);
+    if (res.preferTotal) bullet(`${res.preferGot} of ${res.preferTotal} preferred days granted; the misses lost out to load balancing or one-shift-per-day.`);
+    if (res.capsHit.length) bullet(`Shift caps held: ${res.capsHit.map(n => n.replace(/,.*$/, '')).join(', ')} stopped at their requested maximums.`);
+    const runners = [...res.stats.values()].filter(s => s.longestRun >= 3).sort((a, b) => b.longestRun - a.longestRun).slice(0, 2);
+    for (const r of runners) bullet(`Block scheduling: ${r.who.replace(/,.*$/, '')} works up to ${r.longestRun} consecutive days rather than scattered singles.`);
+    bullet('No overnight-into-morning turnarounds and no stretches over 5 days, by rule.');
+    for (const r of [...res.reqs.values()].filter(r => r.note && !r.off.size && !r.prefer.size && !r.cap)) {
+      bullet(`Noted but not auto-enforced: ${r.who.replace(/,.*$/, '')} — “${r.note}”.`);
+    }
+    notesBox.append(ul);
+    wrap.append(notesBox);
+
+    /* per-provider table */
+    const provBox = el('div', 'reqform');
+    provBox.append(el('h2', '', 'Proposed load by provider'));
+    const pt = el('table', 'flat');
+    pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Assigned</th><th>Target</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
+    const ptb = el('tbody');
+    for (const s of [...res.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned)) {
+      const tr = el('tr');
+      const tdN = el('td', '', s.who);
+      if (s.float) tdN.append(el('span', 'floatpill', 'float'));
+      tr.append(tdN);
+      tr.append(el('td', '', s.role));
+      tr.append(el('td', '', String(s.assigned)));
+      tr.append(el('td', '', String(s.target)));
+      tr.append(el('td', '', s.preferGot ? `✓ ${s.preferGot}` : '—'));
+      tr.append(el('td', '', s.longestRun >= 2 ? `${s.longestRun} days` : '—'));
+      ptb.append(tr);
+    }
+    pt.append(ptb);
+    provBox.append(pt);
+    wrap.append(provBox);
+
+    /* actions */
+    const act = el('div', 'reqform');
+    const arow = el('div', 'reqrow');
+    if (!g.applied) {
+      const apply = el('button', 'primary genbtn', `Apply ${res.assignments.length} assignments as drafts`);
+      apply.onclick = () => { applyGeneration(res); g.applied = true; render(); };
+      arow.append(apply);
+    } else {
+      arow.append(el('span', 'okhint', `✓ Applied as drafts — publish from the Builder when ready`));
+      const open = el('button', 'primary', 'Open Builder');
+      open.onclick = () => { state.site = g.site; state.month = g.month; setView('builder'); };
+      arow.append(open);
+    }
+    const mail = el('button', '', g.showEmails ? 'Hide email previews' : '📧 Preview provider emails');
+    mail.onclick = () => { g.showEmails = !g.showEmails; render(); };
+    arow.append(mail);
+    act.append(arow);
+    act.append(el('div', 'reqhint', 'Drafts stay invisible to staff until you Publish & notify in the Builder. Emails are previews — sending requires the production backend.'));
+    wrap.append(act);
+
+    /* email previews */
+    if (g.showEmails) {
+      const eb = el('div', 'reqform');
+      eb.append(el('h2', '', 'Email previews — drafted by AI'));
+      const renderEmail = (m, label) => {
+        const card = el('div', 'emailcard');
+        const head = el('div', 'emailhead');
+        head.innerHTML = `<b>${label}</b> · To: ${m.to}<br>Subject: <b>${m.subject.replace(/</g, '&lt;')}</b>`;
+        card.append(head, el('div', 'emailbody', m.body));
+        return card;
+      };
+      eb.append(renderEmail(collectEmail(g.site, g.month), 'Request collection (sent before scheduling)'));
+      const assigned = [...res.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned);
+      for (const s of assigned.slice(0, 3)) eb.append(renderEmail(scheduleEmail(res, s.who), 'Schedule delivery'));
+      if (assigned.length > 3) eb.append(el('div', 'reqhint', `…plus ${assigned.length - 3} more personalized schedule emails drafted, one per provider.`));
+      wrap.append(eb);
+    }
+  }
+
+  main.append(wrap);
+}
+
 /* ---------- shift dialog (draft editor) ---------- */
 
 let dialogShift = null;
@@ -1218,6 +1685,14 @@ function download(name, text, type) {
 const csvEsc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
 
 function exportCsv() {
+  if (state.view === 'generate' && state.gen.result) {
+    const rows = [['Date', 'Start', 'End', 'Position', 'Site', 'AssignedTo', 'PreferredDay'].join(',')];
+    for (const a of state.gen.result.assignments) {
+      rows.push([a.slot.date, a.slot.start, a.slot.end, csvEsc(a.slot.pos), csvEsc(a.slot.site), csvEsc(a.who), a.preferred ? 'yes' : ''].join(','));
+    }
+    download(`ai-proposal-${state.gen.site}-${state.gen.month}.csv`, rows.join('\n'), 'text/csv');
+    return;
+  }
   if (state.view === 'reports') {
     const rows = [['Name', 'Shifts', 'Hours', 'Nights', 'WeekendDays', 'Sites'].join(',')];
     for (const p of fairnessRows(state.month).sort((a, b) => b.n - a.n)) {
@@ -1377,6 +1852,7 @@ function render() {
   else if (state.view === 'coverage') renderCoverage(main);
   else if (state.view === 'builder') renderBuilder(main);
   else if (state.view === 'reports') renderReports(main);
+  else if (state.view === 'generate') renderGenerate(main);
   else renderAudit(main);
   renderBell();
 }

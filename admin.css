@@ -260,8 +260,50 @@ table.flat th.sorted { color: var(--rh-yellow); }
 .auditkind.publish { background: color-mix(in srgb, var(--rh-yellow) 20%, var(--panel)); color: var(--rh-yellow); border: 1px solid var(--rh-yellow); }
 .auditkind.edit { background: color-mix(in srgb, var(--rh-purple) 20%, var(--panel)); color: #cf9fe8; border: 1px solid var(--rh-purple); }
 .auditkind.message { background: color-mix(in srgb, var(--rh-cyan) 16%, var(--panel)); color: #78eaff; border: 1px solid var(--rh-cyan); }
+.auditkind.ai { background: color-mix(in srgb, var(--rh-yellow) 22%, var(--panel)); color: #ffd98a; border: 1px solid var(--rh-yellow); }
 .audittext { flex: 1; }
 .auditdate { flex: none; color: var(--ink-soft); font-size: 11.5px; }
+
+/* ---- generate ---- */
+.genintro h2 { color: var(--rh-yellow); }
+.genbtn { font-size: 14px; padding: 9px 18px; white-space: nowrap; }
+.genstatus { margin-top: 12px; color: var(--rh-cyan); font-size: 13px; min-height: 1.2em; animation: genpulse 1.4s ease-in-out infinite; }
+@keyframes genpulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+.srcpill {
+  display: inline-block;
+  padding: 1px 9px;
+  border-radius: 20px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+.src-example { background: color-mix(in srgb, var(--rh-purple) 22%, var(--panel)); color: #cf9fe8; border: 1px solid var(--rh-purple); }
+.src-submitted { background: color-mix(in srgb, var(--rh-cyan) 18%, var(--panel)); color: #78eaff; border: 1px solid var(--rh-cyan); }
+.ainotes { margin: 4px 0 0; padding-left: 20px; }
+.ainotes li { margin: 6px 0; font-size: 13.5px; line-height: 1.45; }
+.floatpill {
+  margin-left: 7px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+.emailcard {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--rh-cyan);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 11px 13px;
+  margin: 10px 0;
+  font-size: 13px;
+}
+.emailhead { color: var(--ink-soft); font-size: 12px; line-height: 1.5; margin-bottom: 8px; }
+.emailhead b { color: var(--ink); }
+.emailbody { white-space: pre-wrap; line-height: 1.5; }
 
 @media (max-width: 900px) {
   .publishbar { position: static; flex-wrap: wrap; }

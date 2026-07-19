@@ -26,9 +26,16 @@ Two surfaces (both on the shared demo PIN for now; the split-PIN option is one
 - `admin.html` — **scheduler console** (amber-accented).
   Approvals inbox with conflict checks, a coverage/gaps board with fair-fill
   suggestions, a schedule builder with a draft → publish workflow (staff are
-  notified on publish), fairness/wellness reports, and an audit trail. Both
-  surfaces share the same browser-local overlay, so employee submissions land
-  in the console live (open them side-by-side in two windows for the full demo).
+  notified on publish), fairness/wellness reports, an audit trail, and a
+  **✨ Generate tab**: months are scaffolded (unfilled) through December, and a
+  live in-browser reconciliation engine builds a proposed schedule from
+  provider requests — days off are hard rules, caps/rest/5-day-max enforced,
+  blocks kept together, load balanced. Example request lists are seeded for
+  NMMC-Tupelo and DCH-Northport (September); in-app submissions merge in.
+  Includes AI-drafted provider email previews (request collection + schedule
+  delivery). Both surfaces share the same browser-local overlay, so employee
+  submissions land in the console live (open them side-by-side in two windows
+  for the full demo).
 
 To (re)encrypt after changing data or PINs:
 

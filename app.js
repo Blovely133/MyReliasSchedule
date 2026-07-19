@@ -140,6 +140,9 @@ async function loadData(pin) {
     if (s.site || !posSite[s.pos]) continue;
     s.site = Object.entries(posSite[s.pos]).sort((a, b) => b[1] - a[1])[0][0];
   }
+  /* Tupelo's zone positions are almost entirely unassigned in W2W, so the
+     assignment-based inference misses them — tag them by position name */
+  for (const s of base) if (!s.site && /tupelo|\btup\b/i.test(s.pos)) s.site = 'TUP';
   $('#dataNote').textContent = `Imported from WhenToWork · ${fmtDate(raw.range[0])} – ${fmtDate(raw.range[1])}`;
   try { overlay = { ...DEFAULT_OVERLAY(), ...JSON.parse(localStorage.getItem(LS_KEY) || '{}') }; } catch {}
   if (!overlay.requests) overlay.requests = [];
