@@ -1211,16 +1211,43 @@ function requestsFor(site, mo) {
   return map;
 }
 
-function poolFor(site, mo) {
-  const ex = EXAMPLE_SCHEDULING[site];
-  if (ex && ex.month === mo) return ex.pool.map(([who, role, target, float]) => ({ who, role, target, float: !!float }));
-  /* other sites: derive the pool from who actually worked there in August */
-  const counts = {};
+/* average distinct days/month each provider worked at `site` over the recent
+   complete months — the anchor for generation targets */
+const HIST_MONTHS = ['2026-06', '2026-07', '2026-08'];
+function siteAvgDays(site) {
+  const perMonth = new Map();
   for (const s of base) {
-    if (s.forecast || s.site !== site || !s.who || !s.date.startsWith('2026-08')) continue;
-    counts[s.who] = (counts[s.who] || 0) + 1;
+    if (s.forecast || !s.who || s.site !== site) continue;
+    const mo = s.date.slice(0, 7);
+    if (!HIST_MONTHS.includes(mo)) continue;
+    if (!perMonth.has(s.who)) perMonth.set(s.who, {});
+    const rec = perMonth.get(s.who);
+    (rec[mo] = rec[mo] || new Set()).add(s.date);
   }
-  return Object.entries(counts).map(([who, n]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, n), float: false }));
+  const avg = new Map();
+  for (const [who, rec] of perMonth) {
+    const counts = Object.values(rec).map(set => set.size);   // months they actually worked
+    avg.set(who, { avg: counts.reduce((a, b) => a + b, 0) / counts.length, months: counts.length });
+  }
+  return avg;
+}
+
+function poolFor(site, mo) {
+  const avg = siteAvgDays(site);
+  const ex = EXAMPLE_SCHEDULING[site];
+  if (ex && ex.month === mo) {
+    return ex.pool.map(([who, role, seeded, float]) => {
+      const h = avg.get(who);
+      /* floats keep their small caps; regulars target their own recent average
+         when it's a credible signal (2+ months, 4+ days/mo) — otherwise the
+         planned roster number stands in for missing/stray W2W history */
+      const useAvg = !float && !!h && h.months >= 2 && h.avg >= 4;
+      return { who, role, target: useAvg ? Math.round(h.avg) : seeded, avg: h ? h.avg : 0, fromAvg: useAvg, float: !!float };
+    });
+  }
+  return [...avg.entries()]
+    .filter(([, h]) => h.avg >= 1)
+    .map(([who, h]) => ({ who, role: providerRole({ pos: '', who }) || 'ANY', target: Math.max(2, Math.round(h.avg)), avg: h.avg, fromAvg: true, float: false }));
 }
 
 function runGeneration(site, mo) {
@@ -1461,7 +1488,7 @@ function renderGenerate(main) {
   const intro = el('div', 'reqform genintro');
   intro.append(el('h2', '', '✨ AI schedule generation'));
   intro.append(el('div', 'reqhint',
-    'Collect requests → reconcile → draft → publish. The reconciliation engine runs live in this browser — days off are never violated, caps and rest rules hold, blocks stay together, load balances. In production the same loop runs through Claude\'s API, including emailing providers to collect requests and sending everyone their schedule.'));
+    'Collect requests → reconcile → draft → publish. The reconciliation engine runs live in this browser — days off are never violated, caps and rest rules hold, blocks stay together, and each provider is targeted at their own average days worked over the last three months. In production the same loop runs through Claude\'s API, including emailing providers to collect requests and sending everyone their schedule.'));
   wrap.append(intro);
 
   /* controls */
@@ -1548,6 +1575,8 @@ function renderGenerate(main) {
     const ul = el('ul', 'ainotes');
     const bullet = t => ul.append(el('li', '', t));
     bullet(`Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
+    const avgEx = [...res.stats.values()].filter(s => s.fromAvg && s.assigned).sort((a, b) => b.assigned - a.assigned)[0];
+    bullet(`Each provider's target is their own average days worked per month, June–August${avgEx ? ` — e.g., ${avgEx.who.replace(/,.*$/, '')} averages ${avgEx.avg.toFixed(1)} days/month and is proposed for ${avgEx.assigned}` : ''}.`);
     if (res.unfilled.length > 15) bullet(`Coverage gap: roughly ${Math.ceil(res.unfilled.length / 13)} more full-time providers are needed to fully cover ${siteName(res.site)} — a concrete number for recruiting.`);
     bullet(`Every requested day off was honored — the engine treats “unavailable” as a hard rule, never a suggestion.`);
     if (res.preferTotal) bullet(`${res.preferGot} of ${res.preferTotal} preferred days granted; the misses lost out to load balancing or one-shift-per-day.`);
@@ -1565,8 +1594,9 @@ function renderGenerate(main) {
     const provBox = el('div', 'reqform');
     provBox.append(el('h2', '', 'Proposed load by provider'));
     const pt = el('table', 'flat');
-    pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Assigned</th><th>Target</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
+    pt.innerHTML = '<thead><tr><th>Provider</th><th>Role</th><th>Assigned</th><th>Target (3-mo avg)</th><th>Preferred days</th><th>Longest block</th></tr></thead>';
     const ptb = el('tbody');
+    let anyPlanned = false;
     for (const s of [...res.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned)) {
       const tr = el('tr');
       const tdN = el('td', '', s.who);
@@ -1574,13 +1604,19 @@ function renderGenerate(main) {
       tr.append(tdN);
       tr.append(el('td', '', s.role));
       tr.append(el('td', '', String(s.assigned)));
-      tr.append(el('td', '', String(s.target)));
+      if (s.fromAvg) {
+        tr.append(el('td', '', `${s.target} (avg ${s.avg.toFixed(1)})`));
+      } else {
+        anyPlanned = true;
+        tr.append(el('td', '', `${s.target} *`));
+      }
       tr.append(el('td', '', s.preferGot ? `✓ ${s.preferGot}` : '—'));
       tr.append(el('td', '', s.longestRun >= 2 ? `${s.longestRun} days` : '—'));
       ptb.append(tr);
     }
     pt.append(ptb);
     provBox.append(pt);
+    if (anyPlanned) provBox.append(el('div', 'reqhint', '* no recent W2W history at this site (or float pool) — target comes from the planned demo roster instead of a worked average.'));
     wrap.append(provBox);
 
     /* actions */
