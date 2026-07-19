@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MyReliasSchedule — Feasibility Prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗓️</text></svg>">
+</head>
+<body class="access-locked">
+<div id="accessGate" class="access-gate">
+  <form id="accessForm" class="access-card">
+    <div class="access-mark" aria-hidden="true">MRS</div>
+    <span class="access-kicker">MyReliasSchedule</span>
+    <h1>Welcome to the feasibility prototype</h1>
+    <p>Enter the shared four-digit PIN to load the interactive schedule.</p>
+    <label for="accessPin">Access PIN</label>
+    <input id="accessPin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off" required autofocus>
+    <button id="accessSubmit" type="submit" class="primary">Open schedule</button>
+    <p id="accessError" class="access-error" role="alert"></p>
+    <small>Lightweight prototype access gate—not production authentication.</small>
+  </form>
+</div>
+<header class="topbar">
+  <div class="brand">
+    <!-- official rh mark (white+cyan, made for dark backgrounds) inlined from reliashealthcare.com -->
+    <svg class="brand-logo" viewBox="0 0 93 50" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Relias Healthcare">
+      <path d="M48.1111 24.1007V38.3528H53.4472V24.1007C53.4472 21.6134 55.0451 19.9455 57.5521 19.8185V19.8151H62.8461V14.7549H57.5521C51.5894 14.6668 48.1103 18.6172 48.1103 24.1007" fill="white"/>
+      <path d="M87.0935 24.1048V38.3543H81.7641V24.1048C81.7641 21.6132 80.1654 19.9487 77.6542 19.8217V19.8124H73.0927V38.3543H67.7541V3.50732H73.0927V14.7564H77.6542C83.616 14.6658 87.0935 18.6119 87.0935 24.1048Z" fill="white"/>
+      <path d="M3.72203 7.92529C1.96773 9.6905 1.97025 12.5538 3.72792 14.3156L12.1748 22.7827L12.1723 22.7844C13.6793 24.4615 13.6432 26.5332 12.0806 28.1045L10.0244 30.1602C8.15573 32.0286 8.15068 35.0706 10.0143 36.945L15.458 31.502C18.9036 28.036 19.1828 23.3245 15.3538 19.5841L3.72203 7.92529Z" fill="#00BEDD"/>
+      <path d="M30.5403 31.518L39.893 40.7868C41.6448 39.025 41.6338 36.1634 39.8694 34.4151L33.7193 28.3203L33.7218 28.3177C32.2147 26.6414 32.2509 24.5697 33.8135 22.9976L35.0438 21.764C36.9117 19.8922 36.9142 16.8494 35.0497 14.9741L30.4352 19.6001C28.6918 21.3534 27.7592 23.4268 27.7592 25.5307C27.7592 27.5854 28.6481 29.6698 30.5395 31.518" fill="#00BEDD"/>
+      <path d="M17.0155 17.9127C20.7344 21.7648 25.4179 21.4837 28.8634 18.0185L39.9645 6.79989C38.1 4.92377 35.0775 4.92716 33.2172 6.80751L25.486 14.6201C23.9234 16.1923 21.8639 16.2279 20.197 14.7133L20.1953 14.715L19.4376 13.9505C17.685 12.1819 14.8399 12.1793 13.0848 13.9454L17.0164 17.9135L17.0155 17.9127Z" fill="#00BEDD"/>
+      <path d="M28.8794 33.2002C25.1605 29.348 20.4771 29.6291 17.0315 33.0943L5.93047 44.3129C7.79494 46.189 10.8175 46.1857 12.6777 44.3053L20.4089 36.4927C21.9715 34.9205 24.0311 34.8849 25.6979 36.3995L25.6996 36.3978L26.4573 37.1623C28.2099 38.9309 31.055 38.9335 32.8102 37.1674L28.8785 33.1993L28.8794 33.2002Z" fill="#00BEDD"/>
+    </svg>
+    <div>
+      <h1>MyReliasSchedule</h1>
+      <span class="brand-sub">Feasibility prototype</span>
+    </div>
+  </div>
+  <nav class="tabs" id="viewTabs">
+    <button data-view="month" class="active">Month</button>
+    <button data-view="week">Week</button>
+    <button data-view="people">People</button>
+    <button data-view="requests">Requests</button>
+    <button data-view="contact">Contact</button>
+  </nav>
+  <div class="top-actions">
+    <label class="viewas">
+      <span>Employee view</span>
+      <select id="viewAsSelect"></select>
+    </label>
+    <input id="searchBox" type="search" placeholder="Search name or position…">
+    <button id="icsBtn" title="Download my shifts as a calendar file (.ics) for Apple/Google/Outlook">📅 Add to calendar</button>
+    <button id="exportCsvBtn" title="Export the shifts you're looking at as CSV">CSV</button>
+    <button id="printBtn" title="Print this view">Print</button>
+    <button id="bellBtn" class="bell" title="Notifications">🔔<span id="bellCount" class="bellcount" hidden></span></button>
+  </div>
+</header>
+
+<section class="prototype-banner" aria-label="Prototype notice">
+  <span class="prototype-badge">Feasibility prototype</span>
+  <div class="prototype-message">
+    <strong>Your schedule, without the scavenger hunt.</strong>
+    <span>Explore shifts, preferences, swaps, and coworker communication in one clear workspace.</span>
+  </div>
+  <span class="prototype-note">Demo actions are simulated and stay in this browser.</span>
+</section>
+
+<div class="filterbar" id="filterBar">
+  <div class="weeknav">
+    <button id="prevWeek" title="Previous week">‹</button>
+    <select id="weekSelect"></select>
+    <button id="nextWeek" title="Next week">›</button>
+  </div>
+  <select id="siteFilter"><option value="">All sites</option></select>
+  <select id="posFilter"><option value="">All positions</option></select>
+  <button id="scopeToggle" class="scopetoggle" hidden></button>
+  <span class="weekstats" id="weekStats"></span>
+  <span class="spacer"></span>
+  <span class="data-note" id="dataNote"></span>
+</div>
+
+<div id="notifPanel" class="notifpanel" hidden></div>
+
+<main id="main"></main>
+
+<dialog id="shiftDialog">
+  <form method="dialog" id="shiftForm">
+    <h2 id="dialogTitle">Edit Shift</h2>
+    <div class="grid2">
+      <label>Date <input type="date" name="date" required></label>
+      <label>Position <input name="pos" list="posList" required></label>
+      <label>Start <input type="time" name="start" required></label>
+      <label>End <input type="time" name="end" required></label>
+      <label>Assigned to <input name="who" list="peopleList" placeholder="leave blank = OPEN"></label>
+      <label>Site <input name="site" list="siteList"></label>
+      <label class="wide">Note <input name="note" placeholder="optional note"></label>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="deleteShiftBtn" class="danger">Delete</button>
+      <span class="spacer"></span>
+      <button type="button" id="cancelBtn">Cancel</button>
+      <button type="submit" class="primary" id="saveBtn">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="personDialog" class="person-dialog" aria-labelledby="personDialogTitle">
+  <div class="person-dialog-body">
+    <h2 id="personDialogTitle">Coworker</h2>
+    <div id="personShiftSummary" class="person-shift-summary"></div>
+    <p id="personDialogHint" class="person-dialog-hint"></p>
+
+    <div id="personActions" class="person-actions">
+      <button type="button" id="personSwapBtn" class="primary">Offer a swap</button>
+      <button type="button" id="personContactBtn">Contact</button>
+    </div>
+
+    <form id="directSwapForm" class="person-panel" hidden>
+      <h3>Offer a shift swap</h3>
+      <label>Your shift to offer
+        <select id="mySwapShift" required></select>
+      </label>
+      <label>Their shift you want
+        <select id="theirSwapShift" required></select>
+      </label>
+      <label>Note <input id="directSwapNote" placeholder="Optional note"></label>
+      <div class="dialog-actions">
+        <button type="button" class="personBackBtn">Back</button>
+        <span class="spacer"></span>
+        <button type="submit" class="primary">Send swap offer</button>
+      </div>
+    </form>
+
+    <form id="directContactForm" class="person-panel" hidden>
+      <h3 id="directContactTitle">Contact coworker</h3>
+      <div id="directContactInfo" class="person-contact-info"></div>
+      <label>Message
+        <textarea id="directContactMessage" class="msgbox" required placeholder="Type your message..."></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="personBackBtn">Back</button>
+        <span class="spacer"></span>
+        <button type="submit" class="primary">Send message</button>
+      </div>
+    </form>
+
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button type="button" id="personCloseBtn">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<datalist id="peopleList"></datalist>
+<datalist id="posList"></datalist>
+<datalist id="siteList"></datalist>
+
+<footer class="foot">
+  <span>MyReliasSchedule prototype — changes save in this browser only. </span>
+  <button class="linklike" id="exportJsonBtn">Download data + changes</button>
+  <label class="linklike" for="importJson">Import<input type="file" id="importJson" accept=".json" hidden></label>
+  <button class="linklike danger" id="resetBtn">Discard my changes</button>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
