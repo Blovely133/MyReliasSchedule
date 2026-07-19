@@ -80,8 +80,11 @@ function managerNotifs() {
 }
 
 let auditSeq = 0;
-function audit(text, kind) {
-  overlay.audit.push({ id: 'g' + Date.now() + '-' + (auditSeq++), text, kind: kind || 'edit', actor: 'Scheduler', created: TODAY });
+function audit(text, kind, site) {
+  /* AI/generation actions default to the facility being worked on, so the
+     Audit tab can scope to a site; pass site explicitly where known */
+  const tag = site || (kind === 'ai' ? state.gen.site : '');
+  overlay.audit.push({ id: 'g' + Date.now() + '-' + (auditSeq++), text, kind: kind || 'edit', actor: 'Scheduler', created: TODAY, site: tag || '' });
   if (overlay.audit.length > 500) overlay.audit = overlay.audit.slice(-500);
 }
 
@@ -1196,18 +1199,31 @@ function renderReports(main) {
 function renderAudit(main) {
   const entries = overlay.audit.slice().reverse();
   const q = state.search.toLowerCase();
-  const visible = entries.filter(a => !q || a.text.toLowerCase().includes(q));
-  $('#weekStats').textContent = `${visible.length} logged action${visible.length === 1 ? '' : 's'}`;
+  const site = state.site;
+  /* facility scoping: tagged entries match their tag; untagged (legacy) ones
+     match when the text names the facility or its code */
+  const matchesSite = a => {
+    if (!site) return true;
+    if (a.site) return a.site === site;
+    if (a.text.includes(siteName(site))) return true;
+    return new RegExp(`\\b${site.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(a.text);
+  };
+  const siteFiltered = entries.filter(matchesSite);
+  const hidden = entries.length - siteFiltered.length;
+  const visible = siteFiltered.filter(a => !q || a.text.toLowerCase().includes(q));
+  $('#weekStats').textContent = `${visible.length} logged action${visible.length === 1 ? '' : 's'}${site ? ` at ${siteName(site)}` : ''}`;
 
   const box = el('div', 'reqform');
-  box.append(el('h2', '', 'Audit trail — every scheduler action, newest first'));
+  box.append(el('h2', '', site ? `Audit trail — ${siteName(site)}, newest first` : 'Audit trail — every scheduler action, newest first'));
+  if (site && hidden) box.append(el('div', 'reqhint', `${hidden} entr${hidden === 1 ? 'y' : 'ies'} for other facilities or console-wide actions hidden — set the site filter to “All sites” to see everything.`));
   if (!visible.length) {
-    box.append(el('div', 'approval-empty', 'Nothing logged yet. Approvals, denials, draft edits, publishes, and replies all land here.'));
+    box.append(el('div', 'approval-empty', site ? `Nothing logged for ${siteName(site)} yet.` : 'Nothing logged yet. Approvals, denials, draft edits, publishes, and replies all land here.'));
   } else {
     const listEl = el('div', 'auditlist');
     for (const a of visible.slice(0, 200)) {
       const item = el('div', 'audititem');
       item.append(el('span', 'auditkind ' + (a.kind || 'edit'), a.kind || 'edit'));
+      if (a.site && !site) item.append(el('span', 'auditsite', a.site));
       item.append(el('span', 'audittext', a.text));
       item.append(el('span', 'auditdate', fmtDateLong(a.created)));
       listEl.append(item);
