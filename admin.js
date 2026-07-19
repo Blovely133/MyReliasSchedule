@@ -1755,6 +1755,7 @@ async function runGenerationSolver(site, mo, opts = {}) {
       const { p, pi, st, r } = pr;
       if (need !== 'ANY' && p.role !== 'ANY' && p.role !== need) continue;
       if (r && r.off.has(slot.date)) continue;                                 // hard: unavailable
+      if (opts.excluded && opts.excluded.has(p.who + '|' + slotKey(slot))) continue;   // hard: removed from this exact slot
       if (st.dates.has(slot.date)) continue;                                   // hard: already working that day (any site)
       const prev = st.shiftByDate.get(addDays(slot.date, -1));                 // hard: ≥10h rest vs pre-existing shifts, both directions
       if (prev && absMin(slot.date, slot.start) - shiftEndMin(prev) < MIN_REST_MIN) continue;
@@ -1990,6 +1991,7 @@ async function refillOpenSlots() {
       pool: poolFor(g.site, g.month).filter(p => !(res.clearedWho && res.clearedWho.has(p.who))),   // benched providers sit out
       monthShifts: [...adminShifts().filter(s => s.who && s.date.startsWith(g.month)), ...fixed],
       capAdjust: keptByWho,   // kept proposal shifts consume the cap — refill can't double-load anyone
+      excluded: res.excluded, // removed-from-slot providers never get that slot back
     });
     const merged = {
       ...partial,
@@ -1998,6 +2000,7 @@ async function refillOpenSlots() {
       assignments: [...res.assignments, ...partial.assignments].sort((a, b) =>
         a.slot.date.localeCompare(b.slot.date) || a.slot.start.localeCompare(b.slot.start) || a.slot.pos.localeCompare(b.slot.pos)),
       clearedWho: res.clearedWho,
+      excluded: res.excluded,
     };
     for (const a of res.assignments) {   // fold kept assignments back into the per-provider table
       const st = merged.stats.get(a.who);
@@ -3302,6 +3305,8 @@ function recomputeProposalDerived(res) {
   res.preferGot = [...res.stats.values()].reduce((a, s) => a + (s.preferGot || 0), 0);
 }
 
+function slotKey(slot) { return slot.id || `${slot.date}|${slot.start}|${slot.end}|${slot.pos}`; }
+
 function removeFromSlot(res, slot) {
   const a = res.assignments.find(x => x.slot === slot);
   if (!a) return;
@@ -3309,7 +3314,10 @@ function removeFromSlot(res, slot) {
   if (st) { st.assigned--; st.dates.delete(slot.date); st.shiftByDate?.delete(slot.date); if (a.preferred) st.preferGot--; }
   res.assignments = res.assignments.filter(x => x !== a);
   res.unfilled.push(slot);
-  audit(`Proposal edit: opened up ${describeShift(slot)} (was ${a.who})`, 'ai');
+  /* hard rule: whoever was removed can never be refilled onto THIS slot —
+     a full Generate resets the exclusions */
+  (res.excluded = res.excluded || new Set()).add(a.who + '|' + slotKey(slot));
+  audit(`Proposal edit: opened up ${describeShift(slot)} (was ${a.who} — excluded from getting it back on refill)`, 'ai');
 }
 
 function addToSlot(res, slot, who) {
@@ -3732,14 +3740,18 @@ function renderGenerate(main) {
       ? `⚙ Placed by the HiGHS optimizer — mixed-integer model with ${res.solver.vars.toLocaleString()} decision variables and ${res.solver.rows.toLocaleString()} constraints, solved in-browser in ${(res.solver.ms / 1000).toFixed(1)}s (${res.solver.status === 'Optimal' ? 'proven optimal' : res.solver.status}).`
       : '⚙ Placed by the built-in greedy engine — instant preview; the HiGHS optimizer replaces it in the background when available.'));
 
-    if (res.unfilled.length) {
+    {
       const rr = el('div', 'refillrow');
-      const rb = el('button', 'primary', g.refilling ? '⟲ Refilling…' : `⟲ Refill ${res.unfilled.length} open slot${res.unfilled.length === 1 ? '' : 's'}`);
+      rr.append(el('span', 'reqhint', 'Refill touches ONLY open slots — nobody already placed moves, and whoever you removed from a shift is hard-blocked from getting it back. Full Generate resets everything.'));
+      const rb = el('button', 'primary', g.refilling ? '⟲ Refilling…'
+        : res.unfilled.length ? `⟲ Refill ${res.unfilled.length} open slot${res.unfilled.length === 1 ? '' : 's'}` : '⟲ Refill open slots');
       rb.type = 'button';
-      rb.disabled = !!g.refilling;
-      rb.title = 'Re-run the optimizer over ONLY the open slots. Everyone already placed stays exactly where they are — rest, run, and load rules still hold across the combination.';
+      rb.disabled = !!g.refilling || !res.unfilled.length;
+      rb.title = res.unfilled.length
+        ? 'Re-run the optimizer over ONLY the open slots. Everyone already placed stays exactly where they are — rest, run, and load rules still hold across the combination.'
+        : 'Nothing open right now — remove a shift (click it in the calendar) or clear a provider (✕ below) first.';
       rb.onclick = () => refillOpenSlots();
-      rr.append(rb, el('span', 'reqhint', 'fills only the opens — nobody already placed moves. Clear a provider below (✕) first to redo their shifts.'));
+      rr.append(rb);
       wrap.append(rr);
     }
 
