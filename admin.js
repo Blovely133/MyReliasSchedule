@@ -1594,9 +1594,10 @@ function runGeneration(site, mo) {
       if (st.dates.has(slot.date)) continue;                                     // hard: one shift/day
       const prevShift = st.shiftByDate.get(addDays(slot.date, -1));              // hard: ≥10h rest between shifts
       if (prevShift && absMin(slot.date, slot.start) - shiftEndMin(prevShift) < MIN_REST_MIN) continue;
+      const pMax = (mined && mined.blockMax) || maxRun;                          // mined block rule overrides the global max-run
       let run = 0;
-      for (let k = 1; k <= maxRun; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
-      if (run >= maxRun) continue;                                               // hard: max consecutive days (assistant-tunable, default 5)
+      for (let k = 1; k <= pMax; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
+      if (run >= pMax) continue;                                                 // hard: max consecutive days (assistant-tunable, default 5)
       const bucket = shiftBucket(slot);
       if (st.tod) { if (bucket !== st.tod) continue; }                           // hard: assistant rule ("nights only")
       else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
@@ -1821,17 +1822,39 @@ async function runGenerationSolver(site, mo, opts = {}) {
     }
 
     /* max consecutive days, counting pre-existing shifts in the month AND the
-       anchored edge days just outside it (runs must not restart at the seam) */
+       anchored edge days just outside it (runs must not restart at the seam).
+       A hard mined block rule overrides the global max-run for this provider —
+       a 7-on hospitalist gets real 7-day stretches even with a global max of 5. */
+    const mm = minedMap.get(p.who);
+    const pMax = (mm && mm.blockMax) || maxRun;
     const preDay = new Set([...st.dates].map(d => +d.slice(8)));
     for (const d of st.shiftByDate.keys()) if (!d.startsWith(mo)) preDay.add(dayNumOf(d));
-    for (let i = 1 - maxRun; i <= daysIn; i++) {
+    for (let i = 1 - pMax; i <= daysIn; i++) {
       const terms = [];
       let constC = 0;
-      for (let d = i; d <= i + maxRun; d++) {
+      for (let d = i; d <= i + pMax; d++) {
         if (wByDay.has(d)) terms.push(wByDay.get(d));
         else if (preDay.has(d)) constC++;
       }
-      if (terms.length && terms.length + constC > maxRun) addCon(`${terms.join(' + ')} <= ${Math.max(0, maxRun - constC)}`);
+      if (terms.length && terms.length + constC > pMax) addCon(`${terms.join(' + ')} <= ${Math.max(0, pMax - constC)}`);
+    }
+
+    /* mined block structure: blocks run at least blockMin days — a block start
+       (worked day d but not d−1) forces the next blockMin−1 days. Relaxed when
+       a continuation day has no eligible slot or falls past the month end, so
+       structure can never cost coverage outright. */
+    if (mm && mm.blockMin >= 2) {
+      for (const [day, w] of wByDay) {
+        if (preDay.has(day - 1)) continue;                    // continues an anchored block — not a start
+        const left = wByDay.get(day - 1) || null;             // absent → day-1 unworkable → working day IS a start
+        for (let k = 1; k < mm.blockMin; k++) {
+          const t = day + k;
+          if (preDay.has(t)) continue;                        // that day is already worked — satisfied
+          const wt = wByDay.get(t);
+          if (!wt) break;                                     // can't force beyond eligibility/month — relax
+          addCon(left ? `${wt} - ${w} + ${left} >= 0` : `${wt} - ${w} >= 0`);
+        }
+      }
     }
 
     const wNames = [...wByDay.values()];
@@ -1855,7 +1878,7 @@ async function runGenerationSolver(site, mo, opts = {}) {
     /* block scheduling: reward back-to-back worked days (greedy's +45),
        scaled by the provider's mined block style (7-on folks get double,
        scattered-singles folks nearly none) */
-    const blockW = Math.round(45 * ((minedMap.get(p.who) || {}).blockMult ?? 1));
+    const blockW = Math.round(45 * (mm ? mm.blockMult : 1));
     if (blockW > 0) {
       for (const [day, w] of wByDay) {
         const left = wByDay.get(day - 1) || (preDay.has(day - 1) ? true : null);
@@ -1993,17 +2016,39 @@ function mineHistory(excludeMo) {
       const top = shares.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 3).map(x => DOW_NAMES[x[1]]);
       out.push({ kind: 'dowPattern', share: shares, mode: 'soft', conf: Math.min(1, (mx - 1) / 1.5), support: n, text: `${first}: weekdays skew ${top.join('/')}` });
     }
-    /* soft: block style (7-on stretches vs scattered singles) */
-    const runs = [];
-    let run = 1;
+    /* consecutive-day runs — dropping any run truncated by the data window or
+       an excluded month (a sliced block fakes a short one; Blake's "1-day
+       block" was really a February block cut at the March 1 boundary) */
+    const runObjs = [];
+    let runStart = list[0], runLen = 1;
     for (let i = 1; i <= list.length; i++) {
-      if (i < list.length && list[i] === addDays(list[i - 1], 1)) run++;
-      else { runs.push(run); run = 1; }
+      if (i < list.length && list[i] === addDays(list[i - 1], 1)) { runLen++; continue; }
+      runObjs.push({ first: runStart, last: list[i - 1], len: runLen });
+      if (i < list.length) { runStart = list[i]; runLen = 1; }
     }
-    const meanRun = runs.reduce((a, b) => a + b, 0) / runs.length;
-    const modeRun = [...runs.reduce((m, r) => m.set(r, (m.get(r) || 0) + 1), new Map())].sort((a, b) => b[1] - a[1])[0][0];
-    if (modeRun >= 5) out.push({ kind: 'blockStyle', mult: 2, mode: 'soft', conf: Math.min(1, meanRun / 7), support: runs.length, text: `${first}: long stretches (typical block ${modeRun}, avg ${meanRun.toFixed(1)})` });
-    else if (meanRun < 1.5 && runs.length >= 6) out.push({ kind: 'blockStyle', mult: 0.3, mode: 'soft', conf: Math.min(1, 1 - meanRun / 3), support: runs.length, text: `${first}: mostly single days (avg block ${meanRun.toFixed(1)})` });
+    const seam = d => d < minD || d > maxD || (excludeMo && d.startsWith(excludeMo));
+    const runs = runObjs.filter(o => !seam(addDays(o.first, -1)) && !seam(addDays(o.last, 1))).map(o => o.len);
+    /* block STRUCTURE: a tight band of block lengths (e.g. always 3–4 days) is
+       a shape rule the optimizer can enforce — and combined with an exact
+       monthly load it pins the whole composition (10 in 3–4s ⇒ 3+3+4).
+       10% trimmed per tail so a one-off swap pickup can't widen the band. */
+    let blockRule = null;
+    if (runs.length >= 6) {
+      const sr = runs.slice().sort((a, b) => a - b);
+      const lo = sr[Math.floor(sr.length * 0.1)];
+      const hi = sr[Math.min(sr.length - 1, Math.ceil(sr.length * 0.9) - 1)];
+      const within = runs.filter(r2 => r2 >= lo && r2 <= hi).length / runs.length;
+      if (lo >= 2 && hi <= 10 && hi - lo <= 3) {
+        blockRule = { kind: 'blockLen', min: lo, max: hi, mode: within >= 0.92 ? 'hard' : 'soft', conf: within, support: runs.length, text: `${first}: works in blocks of ${lo === hi ? lo : lo + '–' + hi} days (${runs.length} blocks)` };
+        out.push(blockRule);
+      }
+    }
+    if (!blockRule && runs.length) {
+      const meanRun = runs.reduce((a, b) => a + b, 0) / runs.length;
+      const modeRun = [...runs.reduce((m, r) => m.set(r, (m.get(r) || 0) + 1), new Map())].sort((a, b) => b[1] - a[1])[0][0];
+      if (modeRun >= 5) out.push({ kind: 'blockStyle', mult: 2, mode: 'soft', conf: Math.min(1, meanRun / 7), support: runs.length, text: `${first}: long stretches (typical block ${modeRun}, avg ${meanRun.toFixed(1)})` });
+      else if (meanRun < 1.5 && runs.length >= 6) out.push({ kind: 'blockStyle', mult: 0.3, mode: 'soft', conf: Math.min(1, 1 - meanRun / 3), support: runs.length, text: `${first}: mostly single days (avg block ${meanRun.toFixed(1)})` });
+    }
     /* load consistency: someone who works the same number of days every single
        complete month is telling you their contract, not a coincidence — pin it.
        (hard = cap at N and floor raised to N; near-constant = soft pull to N) */
@@ -2071,7 +2116,7 @@ function compileMinedRules(an = overlay.analyze) {
   const map = new Map();
   if (!an || !an.rules) return map;
   for (const [who, rs] of Object.entries(an.rules)) {
-    const c = { dowNever: new Set(), dowAvoid: new Set(), weekendNever: false, weekendBias: 0, dowShare: null, blockMult: 1, posOnly: null, posPrefer: null, loadN: null, loadHard: false };
+    const c = { dowNever: new Set(), dowAvoid: new Set(), weekendNever: false, weekendBias: 0, dowShare: null, blockMult: 1, posOnly: null, posPrefer: null, loadN: null, loadHard: false, blockMin: 0, blockMax: null };
     let any = false;
     for (const r of rs) {
       if (r.mode === 'off') continue;
@@ -2082,6 +2127,10 @@ function compileMinedRules(an = overlay.analyze) {
       else if (r.kind === 'weekendBias') c.weekendBias = r.dir;
       else if (r.kind === 'dowPattern') c.dowShare = r.share;
       else if (r.kind === 'blockStyle') c.blockMult = r.mult;
+      else if (r.kind === 'blockLen') {
+        if (hard) { c.blockMin = r.min; c.blockMax = r.max; }   // hard: overrides the global max-run for this provider, both directions
+        else c.blockMult = Math.max(c.blockMult, 1.5);
+      }
       else if (r.kind === 'posOnly') { if (hard) c.posOnly = r.pos; else c.posPrefer = r.pos; }
       else if (r.kind === 'posPrefer') c.posPrefer = r.pos;
       else if (r.kind === 'loadExact') { c.loadN = r.n; c.loadHard = hard; }
