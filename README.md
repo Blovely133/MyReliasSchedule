@@ -19,10 +19,11 @@ The published app loads an AES-GCM encrypted schedule after the shared PIN is
 entered. The four-digit PIN is a lightweight prototype deterrent, not production
 authentication. Raw schedule imports are intentionally excluded from Git.
 
-Two surfaces, two PINs:
+Two surfaces (both on the shared demo PIN for now; the split-PIN option is one
+`encrypt-data.mjs` run away):
 
-- `index.html` — **employee prototype** (shared staff PIN)
-- `admin.html` — **scheduler console** (separate scheduler PIN; amber-accented).
+- `index.html` — **employee prototype**
+- `admin.html` — **scheduler console** (amber-accented).
   Approvals inbox with conflict checks, a coverage/gaps board with fair-fill
   suggestions, a schedule builder with a draft → publish workflow (staff are
   notified on publish), fairness/wellness reports, and an audit trail. Both
