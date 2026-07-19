@@ -1506,9 +1506,11 @@ function findPerson(text) {
   return matches.size === 1 ? [...matches][0] : null;
 }
 
-const STOPCAPS = /^(Sept?|September|Octo?b?e?r?|Nove?m?b?e?r?|Dece?m?b?e?r?|Jan\w*|Feb\w*|Mar\w*|Apr\w*|May|Jun\w*|Jul\w*|Aug\w*|Add|New|Hire|Take|Move|Give|Cap|Limit|Nights?|Days?|Evenings?|Only|About|Per|Month|Shifts?|Physician|Doctor|Provider|Nurse|Starting|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Zone|The|She|He|They|We|Our|His|Her|Their)$/i;
+const STOPCAPS = /^(Sep|Sept|September|Oct|October|Nov|November|Dec|December|Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Add|New|Hire|Take|Move|Give|Cap|Limit|Nights?|Days?|Evenings?|Only|About|Per|Month|Shifts?|Physician|Doctor|Provider|Nurse|Starting|Joining|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Zone|The|She|He|They|We|Our|His|Her|Their)$/i;
 function extractNewName(original) {
-  for (const m of original.matchAll(/\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b/g)) {
+  /* lookahead keeps pairs overlapping, so "Hire Marcus Webb" tries (Marcus, Webb)
+     even after (Hire, Marcus) is rejected */
+  for (const m of original.matchAll(/\b([A-Z][a-z]{2,})\s+(?=([A-Z][a-z]{2,})\b)/g)) {
     if (STOPCAPS.test(m[1]) || STOPCAPS.test(m[2])) continue;
     return `${m[1]} ${m[2]}`;
   }
