@@ -83,6 +83,11 @@ const SITE_NAMES = {
 };
 const siteName = code => SITE_NAMES[code] || code;
 
+/* phone layout: month/week/swap render as agenda lists instead of 7-col grids */
+const phoneMq = window.matchMedia('(max-width: 640px)');
+const isPhone = () => phoneMq.matches;
+phoneMq.addEventListener('change', () => { if (base.length) render(); });
+
 const $ = s => document.querySelector(s);
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -402,7 +407,7 @@ function openShiftFromSchedule(s) {
   openPersonDialog(s.who || '', s);
 }
 
-function chipFor(s) {
+function chipFor(s, opts = {}) {
   const b = el('button', 'chip' + (s.who ? '' : ' open') + (s.edited ? ' edited' : ''));
   const isMine = Boolean(state.viewAs && s.who === state.viewAs);
   const role = providerRole(s);
@@ -411,15 +416,82 @@ function chipFor(s) {
   const t = el('span', 't', `${s.start}–${s.end}`);
   const who = el('span', 'who', isMine ? s.who.replace(/,.*$/, '') : (s.who || 'OPEN'));
   b.append(t, who);
-  const meta = !isMine ? [s.site, role].filter(Boolean).join(' · ') : '';
+  /* agenda chips carry the position (grid views show it as the row header) */
+  const metaParts = [];
+  if (opts.showPos) metaParts.push(s.pos);
+  if (s.site && (!opts.showPos || !s.pos.includes(s.site))) metaParts.push(s.site);
+  if (!isMine) metaParts.push(role);
+  const meta = (isMine && !opts.showPos) ? '' : metaParts.filter(Boolean).join(' · ');
   if (meta) b.append(el('span', 'site', meta));
-  if (!isMine && s.note) b.append(el('span', 'note', s.note));
+  if (s.note && (!isMine || opts.showPos)) b.append(el('span', 'note', s.note));
   b.title = `${s.start}–${s.end} · ${s.pos} · ${s.who || 'OPEN'}${s.site ? ` · ${siteName(s.site)}` : ''}${s.note ? ` — ${s.note}` : ''}`;
   if (state.search && !matchesSearch(s, state.search.toLowerCase())) b.classList.add('dim');
   if (isMine) b.classList.add('my-shift');
   if (state.viewAs) b.classList.add(s.who && s.who !== state.viewAs ? 'coworker-shift' : 'readonly-shift');
   b.onclick = () => openShiftFromSchedule(s);
   return b;
+}
+
+/* ---------- phone agenda (stacked day cards instead of 7-col grids) ---------- */
+
+const AGENDA_COLLAPSED = 4;
+
+function renderAgenda(main, days, byDay, chipFn, opts = {}) {
+  const collapse = opts.collapse || AGENDA_COLLAPSED;
+  const wrap = el('div', 'agenda');
+  const q = state.search.toLowerCase();
+  for (const iso of days) {
+    const cell = (byDay.get(iso) || []).slice()
+      .sort((a, b) => a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
+    const pref = opts.prefFor ? opts.prefFor(iso) : null;
+    if (!cell.length && !pref && opts.skipEmpty) continue;
+    const card = el('div', 'aday' + (iso === TODAY ? ' today' : ''));
+    const head = el('div', 'adayhead');
+    head.append(el('span', 'adayname', fmtDateLong(iso)));
+    if (iso === TODAY) head.append(el('span', 'todaytag', 'Today'));
+    const openCount = cell.filter(s => !s.who).length;
+    if (openCount) head.append(el('span', 'opendot', `${openCount} open`));
+    card.append(head);
+    if (pref === 'no') card.append(el('span', 'offday off-pending', 'marked off'));
+    // with a search active, surface matching shifts instead of the first N
+    const ordered = q
+      ? [...cell].sort((a, b) => (matchesSearch(b, q) ? 1 : 0) - (matchesSearch(a, q) ? 1 : 0))
+      : cell;
+    const expanded = state.expandedDays.has(iso);
+    const show = expanded ? ordered : ordered.slice(0, collapse);
+    for (const s of show) card.append(chipFn(s));
+    if (ordered.length > collapse) {
+      const more = el('button', 'morebtn', expanded ? 'show less' : `+${ordered.length - collapse} more`);
+      more.onclick = () => {
+        if (expanded) state.expandedDays.delete(iso); else state.expandedDays.add(iso);
+        render();
+      };
+      card.append(more);
+    }
+    if (!cell.length && pref !== 'no') card.append(el('div', 'anone', 'No shifts'));
+    if (!state.viewAs && opts.addable) {
+      const add = el('button', 'addbtn agenda-add', '+ add shift');
+      add.onclick = () => openDialog(null, { date: iso, pos: state.pos || '', site: state.site || '' });
+      card.append(add);
+    }
+    wrap.append(card);
+  }
+  if (!wrap.children.length) {
+    main.append(el('div', 'empty', opts.emptyText || 'Nothing in this period.'));
+    return;
+  }
+  main.append(wrap);
+}
+
+function monthDays(mo) {
+  const [y, m] = mo.split('-').map(Number);
+  const daysIn = new Date(y, m, 0).getDate();
+  return Array.from({ length: daysIn }, (_, i) => `${mo}-${String(i + 1).padStart(2, '0')}`);
+}
+
+function prefMarkerFor(iso) {
+  if (!state.viewAs) return null;
+  return (overlay.prefs[state.viewAs] || {})[iso] === 'no' ? 'no' : null;
 }
 
 function renderWeek(main) {
@@ -435,6 +507,21 @@ function renderWeek(main) {
 
   if (!list.length) {
     main.append(el('div', 'empty', 'No shifts match these filters this week.'));
+    return;
+  }
+
+  if (isPhone()) {
+    const byDay = new Map();
+    for (const s of list) {
+      if (!byDay.has(s.date)) byDay.set(s.date, []);
+      byDay.get(s.date).push(s);
+    }
+    const mineOnly = state.viewAs && !state.showEveryone;
+    renderAgenda(main, days, byDay, s => chipFor(s, { showPos: true }), {
+      collapse: mineOnly ? Infinity : AGENDA_COLLAPSED,
+      prefFor: prefMarkerFor,
+      addable: true,
+    });
     return;
   }
 
@@ -522,6 +609,18 @@ function renderMonthAll(main) {
   for (const s of list) {
     if (!byDay.has(s.date)) byDay.set(s.date, []);
     byDay.get(s.date).push(s);
+  }
+
+  if (isPhone()) {
+    const mineOnly = state.viewAs && !state.showEveryone;
+    renderAgenda(main, monthDays(mo), byDay, s => chipFor(s, { showPos: true }), {
+      collapse: mineOnly ? Infinity : AGENDA_COLLAPSED,
+      skipEmpty: mineOnly,
+      prefFor: prefMarkerFor,
+      addable: true,
+      emptyText: `No shifts for this view in ${fmtMonth(mo)}.`,
+    });
+    return;
   }
 
   const [y, m] = mo.split('-').map(Number);
@@ -937,7 +1036,10 @@ function renderPrefs(main) {
   const [y, m] = mo.split('-').map(Number);
   const table = el('table', 'bigcal prefcal');
   const hr = el('tr');
-  for (const d of ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']) hr.append(el('th', '', d));
+  const dayNames = isPhone()
+    ? ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    : ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  for (const d of dayNames) hr.append(el('th', '', d));
   table.append(hr);
   const first = new Date(Date.UTC(y, m - 1, 1));
   const daysIn = new Date(y, m, 0).getDate();
@@ -949,9 +1051,9 @@ function renderPrefs(main) {
     td.append(el('div', 'dn', String(day)));
     if (mine) {
       const v = prefs[mine][iso] || null;
-      if (v) td.append(el('span', 'prefchip pref-' + v, PREF_LABEL[v]));
+      if (v) td.append(el('span', 'prefchip pref-' + v, isPhone() ? PREF_LABEL[v].split(' ')[0] : PREF_LABEL[v]));
       const scheduled = shifts().some(s => s.who === mine && s.date === iso);
-      if (scheduled) td.append(el('span', 'prefsched', 'scheduled'));
+      if (scheduled) td.append(el('span', 'prefsched', isPhone() ? 'sched' : 'scheduled'));
       td.classList.add('clickable');
       td.onclick = () => {
         const next = PREF_CYCLE[(PREF_CYCLE.indexOf(v) + 1) % PREF_CYCLE.length];
@@ -1065,6 +1167,7 @@ function swapChip(s, trade, mine) {
   const label = isMine ? s.who.replace(/,.*$/, '') : (s.who ? s.who.replace(/,.*$/, '') : 'OPEN — click to pick up');
   const meta = !isMine ? [s.site, role].filter(Boolean).join(' · ') : '';
   b.append(el('span', 'who', label + (meta ? ` · ${meta}` : '')));
+  if (isPhone()) b.append(el('span', 'site', s.pos));
   const future = s.date >= TODAY;
 
   if (isOpen) {
@@ -1218,6 +1321,15 @@ function renderSwap(main) {
     if (!byDay.has(s.date)) byDay.set(s.date, []);
     byDay.get(s.date).push(s);
   }
+
+  if (isPhone()) {
+    renderAgenda(main, monthDays(mo), byDay, s => swapChip(s, tradeByShift.get(s.id), mine), {
+      skipEmpty: true,
+      emptyText: `Nothing to swap or pick up at your sites in ${fmtMonth(mo)}.`,
+    });
+    return;
+  }
+
   const [y, m] = mo.split('-').map(Number);
   const table = el('table', 'bigcal');
   const hr = el('tr');
@@ -1695,7 +1807,7 @@ function setView(v) {
   state.view = v;
   document.querySelectorAll('#viewTabs button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
   const periodControls = v === 'week' || v === 'month' || v === 'requests';
-  $('#filterBar').querySelector('.weeknav').style.visibility = periodControls ? 'visible' : 'hidden';
+  $('#filterBar').querySelector('.weeknav').style.display = periodControls ? '' : 'none';
   render();
 }
 

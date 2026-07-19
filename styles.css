@@ -722,6 +722,181 @@ dialog h2 { margin: 0 0 12px; font-size: 16px; color: var(--rh-blue); }
 
 .empty { text-align: center; color: var(--ink-soft); padding: 50px 0; }
 
+/* ---- phone agenda (rendered on small screens instead of the 7-col grids) ---- */
+.agenda { display: flex; flex-direction: column; gap: 10px; }
+.aday {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  box-shadow: var(--shadow);
+}
+.aday.today { outline: 2px solid var(--rh-cyan); outline-offset: -2px; }
+.adayhead { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.adayname { font-weight: 700; font-size: 13.5px; }
+.aday.today .adayname { color: #78eaff; }
+.todaytag {
+  color: var(--rh-cyan);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+}
+.adayhead .opendot {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--open-line);
+  background: var(--open-bg);
+  padding: 1px 7px;
+  border-radius: 10px;
+}
+.aday .chip { padding: 8px 10px; font-size: 13px; }
+.aday .chip.mini2 { white-space: normal; overflow: visible; text-overflow: clip; }
+.aday .chip.mini2 .who { display: block; }
+.aday .chip .site, .aday .chip .note { font-size: 11.5px; display: block; }
+.aday .morebtn { padding: 8px 4px; font-size: 12.5px; }
+.anone { color: var(--ink-soft); font-size: 12.5px; padding: 1px 0 3px; }
+.addbtn.agenda-add {
+  visibility: visible;
+  width: 100%;
+  margin-top: 4px;
+  padding: 8px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+html { -webkit-text-size-adjust: 100%; }
+button, select { touch-action: manipulation; }
+
+/* ================= tablet easing ================= */
+@media (max-width: 900px) {
+  .topbar { gap: 10px 12px; }
+  .top-actions input[type=search] { width: 150px; }
+  .viewas select { max-width: 170px; }
+}
+
+/* ================= phone layout ================= */
+@media (max-width: 640px) {
+  /* --- header: compact brand row, actions row below, bell pinned top-right --- */
+  .topbar {
+    position: relative;
+    padding: 9px 12px;
+    gap: 8px 10px;
+  }
+  .brand { gap: 9px; }
+  .brand-logo { height: 30px; }
+  .brand h1 { font-size: 15px; }
+  .brand-sub { font-size: 9.5px; letter-spacing: .4px; }
+  .bell { position: absolute; top: 10px; right: 12px; }
+  .top-actions { flex: 1 1 100%; margin-left: 0; flex-wrap: wrap; gap: 8px; }
+  .viewas { flex: 1 1 100%; }
+  .viewas span { display: none; }
+  .viewas select { flex: 1; width: 100%; max-width: none; }
+  .top-actions input[type=search] { flex: 1 1 auto; width: auto; min-width: 0; }
+  #icsBtn { flex: 0 0 auto; font-size: 12.5px; padding: 8px 10px; }
+  #exportCsvBtn, #printBtn { display: none; }
+
+  /* --- tabs become a fixed bottom app bar --- */
+  .tabs {
+    position: fixed;
+    z-index: 40;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    justify-content: space-around;
+    gap: 0;
+    padding: 4px 6px max(5px, env(safe-area-inset-bottom));
+    background: rgb(1 30 56 / .94);
+    backdrop-filter: saturate(1.2) blur(10px);
+    border-top: 1px solid var(--line);
+    box-shadow: 0 -8px 22px rgb(0 0 0 / .38);
+  }
+  .tabs button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    flex: 1;
+    padding: 5px 2px 4px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.72);
+  }
+  .tabs button::before { font-size: 17px; line-height: 1.2; }
+  #viewTabs [data-view="month"]::before { content: '🗓️'; }
+  #viewTabs [data-view="week"]::before { content: '📆'; }
+  #viewTabs [data-view="people"]::before { content: '👥'; }
+  #viewTabs [data-view="requests"]::before { content: '🔁'; }
+  #viewTabs [data-view="contact"]::before { content: '💬'; }
+  .tabs button.active { background: rgb(0 190 221 / .16); color: #7deaff; font-weight: 700; }
+
+  /* --- prototype banner: one slim line --- */
+  .prototype-banner { padding: 7px 12px; gap: 8px; }
+  .prototype-message span, .prototype-note { display: none; }
+  .prototype-message strong { font-size: 12px; white-space: normal; }
+  .prototype-badge { font-size: 9px; padding: 3px 7px; }
+
+  /* --- filter bar: week nav row, then filters --- */
+  .filterbar { padding: 8px 12px; gap: 8px; }
+  .weeknav { flex: 1 1 100%; }
+  #weekSelect { flex: 1; min-width: 0; max-width: none; }
+  #siteFilter, #posFilter { flex: 1 1 40%; min-width: 0; max-width: none; }
+  .scopetoggle { flex: 1 1 100%; padding: 10px; }
+  .weekstats { flex: 1 1 100%; font-size: 12px; }
+  .data-note { display: none; }
+
+  main { padding: 0 10px 20px; }
+
+  /* --- footer: static, above the bottom bar --- */
+  .foot {
+    position: static;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    padding: 12px 14px calc(66px + env(safe-area-inset-bottom));
+  }
+
+  /* --- inputs: ≥16px font so iOS Safari doesn't auto-zoom on focus --- */
+  input, select, textarea { font-size: 16px !important; }
+  .access-card input { font-size: 20px !important; }
+
+  /* --- dialogs: near-full-width, scrollable --- */
+  dialog { width: min(560px, calc(100vw - 16px)); max-height: 85vh; max-height: 88dvh; overflow-y: auto; padding: 14px; }
+  .person-dialog { width: min(640px, calc(100vw - 16px)); }
+  .grid2 { grid-template-columns: 1fr; }
+  .person-actions button { flex: 1; }
+  .dialog-actions button { padding: 10px 14px; }
+
+  /* --- notifications: full-width sheet --- */
+  .notifpanel { top: 10px; left: 10px; right: 10px; width: auto; max-height: 70vh; max-height: 72dvh; }
+
+  /* --- wide tables pan horizontally --- */
+  table.flat { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+  table.flat th, table.flat td { padding: 10px; }
+
+  /* --- forms reflow to single column --- */
+  .reqform { padding: 12px; }
+  .reqrow label { flex: 1 1 100%; }
+  .reqrow > button { flex: 1 1 100%; padding: 11px; }
+  .subnav { flex-wrap: wrap; }
+  .subnav select { flex: 1; min-width: 0; }
+  .submitbar button { width: 100%; padding: 12px; }
+  .msghead { flex-wrap: wrap; }
+  .growlabel { min-width: 0; }
+
+  /* --- preferences month grid: compact tap targets --- */
+  .bigcal th { padding: 6px 1px; font-size: 10px; letter-spacing: 0; }
+  .bigcal td { height: 54px; padding: 2px; }
+  .bigcal .dn { font-size: 11px; }
+  .prefcal .prefchip { display: block; margin: 2px 0 0; padding: 3px 2px; text-align: center; font-size: 12px; }
+  .prefsched { font-size: 8.5px; text-align: center; }
+  .preflegend { font-size: 11.5px; gap: 6px; }
+}
+
 @media print {
   .topbar .top-actions, .filterbar .weeknav button, .foot, .tabs, td.slot .addbtn, .bigcal .addbtn { display: none !important; }
   body { background: #fff; }

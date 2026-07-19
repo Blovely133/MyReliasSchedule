@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#033059">
 <title>MyReliasSchedule — Feasibility Prototype</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -50,7 +51,7 @@
   <div class="top-actions">
     <label class="viewas">
       <span>Employee view</span>
-      <select id="viewAsSelect"></select>
+      <select id="viewAsSelect" aria-label="Employee view"></select>
     </label>
     <input id="searchBox" type="search" placeholder="Search name or position…">
     <button id="icsBtn" title="Download my shifts as a calendar file (.ics) for Apple/Google/Outlook">📅 Add to calendar</button>
@@ -74,6 +75,7 @@
     <button id="prevWeek" title="Previous week">‹</button>
     <select id="weekSelect"></select>
     <button id="nextWeek" title="Next week">›</button>
+    <button id="todayBtn" title="Jump to today">Today</button>
   </div>
   <select id="siteFilter"><option value="">All sites</option></select>
   <select id="posFilter"><option value="">All positions</option></select>
