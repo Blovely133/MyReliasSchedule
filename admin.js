@@ -29,7 +29,7 @@ let state = {
   focusDay: null,       // set by a coverage-cell click; highlighted in the Builder grid
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
-  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false },
+  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set() },
 };
 
 /* Site codes → full facility names, from WhenToWork's category list */
@@ -1313,7 +1313,7 @@ function applyGeneration(gen) {
 
 function stageGenerate() {
   const g = state.gen;
-  g.running = true; g.result = null; g.applied = false; g.showEmails = false;
+  g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
   render();
   const pool = poolFor(g.site, g.month);
   const reqs = requestsFor(g.site, g.month);
@@ -1375,6 +1375,81 @@ function collectEmail(site, mo) {
 }
 
 /* ---------- generate view ---------- */
+
+/* month-calendar preview of a generated proposal (read-only) */
+function renderProposalCalendar(wrap, res) {
+  const box = el('div', 'reqform');
+  box.append(el('h2', '', `Proposed schedule — ${siteName(res.site)}, ${fmtMonth(res.mo)}`));
+  const legend = el('div', 'preflegend');
+  legend.append(el('span', 'chip mini2 role-phy legendchip', 'physician'));
+  legend.append(el('span', 'chip mini2 role-apc legendchip', 'APC'));
+  legend.append(el('span', 'chip mini2 open legendchip', 'still OPEN'));
+  const pm = el('span', 'chip mini2 legendchip');
+  pm.append(document.createTextNode('name '));
+  pm.append(el('span', 'prefmark', '✓'));
+  pm.append(document.createTextNode(' = preferred day granted'));
+  legend.append(pm);
+  box.append(legend);
+
+  const byDay = new Map();
+  const put = it => {
+    const d = it.slot.date;
+    if (!byDay.has(d)) byDay.set(d, []);
+    byDay.get(d).push(it);
+  };
+  for (const a of res.assignments) put({ slot: a.slot, who: a.who, preferred: a.preferred });
+  for (const s of res.unfilled) put({ slot: s, who: '', preferred: false });
+
+  const [y, m] = res.mo.split('-').map(Number);
+  const table = el('table', 'bigcal');
+  const hr = el('tr');
+  for (const d of ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']) hr.append(el('th', '', d));
+  table.append(hr);
+  const first = new Date(Date.UTC(y, m - 1, 1));
+  const daysIn = new Date(y, m, 0).getDate();
+  let tr = el('tr');
+  for (let i = 0; i < first.getUTCDay(); i++) tr.append(el('td', 'off'));
+  for (let day = 1; day <= daysIn; day++) {
+    const iso = `${res.mo}-${String(day).padStart(2, '0')}`;
+    const td = el('td');
+    const cell = (byDay.get(iso) || []).sort((a, b) =>
+      a.slot.start.localeCompare(b.slot.start) || a.slot.pos.localeCompare(b.slot.pos));
+    const dn = el('div', 'dn');
+    dn.append(el('span', '', String(day)));
+    const openCount = cell.filter(it => !it.who).length;
+    if (openCount) dn.append(el('span', 'opendot', `${openCount} open`));
+    td.append(dn);
+    const expanded = state.gen.expanded.has(iso);
+    const show = expanded ? cell : cell.slice(0, COLLAPSED_CHIPS);
+    for (const it of show) {
+      const s = it.slot;
+      const b = el('button', 'chip mini2 proposal' + (it.who ? '' : ' open'));
+      b.type = 'button';
+      b.style.setProperty('--site', siteColor(s.site));
+      const need = slotRole(s.pos);
+      if (it.who && (need === 'PHY' || need === 'APC')) b.classList.add('role-' + need.toLowerCase());
+      b.append(el('span', 't', `${s.start}–${s.end}`));
+      const who = el('span', 'who', it.who ? it.who.replace(/,.*$/, '') : 'OPEN');
+      if (it.preferred) who.append(el('span', 'prefmark', ' ✓'));
+      b.append(who);
+      b.title = `${s.start}–${s.end} · ${s.pos} · ${it.who || 'OPEN'}${it.preferred ? ' · preferred day granted' : ''}`;
+      td.append(b);
+    }
+    if (cell.length > COLLAPSED_CHIPS) {
+      const more = el('button', 'morebtn', expanded ? 'show less' : `+${cell.length - COLLAPSED_CHIPS} more`);
+      more.onclick = () => {
+        if (expanded) state.gen.expanded.delete(iso); else state.gen.expanded.add(iso);
+        render();
+      };
+      td.append(more);
+    }
+    tr.append(td);
+    if ((first.getUTCDay() + day) % 7 === 0) { table.append(tr); tr = el('tr'); }
+  }
+  if (tr.children.length) { while (tr.children.length < 7) tr.append(el('td', 'off')); table.append(tr); }
+  box.append(table);
+  wrap.append(box);
+}
 
 function renderGenerate(main) {
   const g = state.gen;
@@ -1463,6 +1538,9 @@ function renderGenerate(main) {
     kpis.append(kpi(res.offDays, 'Days-off honored (all of them)', 'ok'));
     kpis.append(kpi(`${res.preferGot}/${res.preferTotal}`, 'Preferred days granted', ''));
     wrap.append(kpis);
+
+    /* proposed month at a glance */
+    renderProposalCalendar(wrap, res);
 
     /* AI notes */
     const notesBox = el('div', 'reqform');

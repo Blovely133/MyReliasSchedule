@@ -304,6 +304,9 @@ table.flat th.sorted { color: var(--rh-yellow); }
 .emailhead { color: var(--ink-soft); font-size: 12px; line-height: 1.5; margin-bottom: 8px; }
 .emailhead b { color: var(--ink); }
 .emailbody { white-space: pre-wrap; line-height: 1.5; }
+.prefmark { color: #4ee6a8; font-weight: 800; }
+.chip.proposal { cursor: default; }
+.chip.proposal:hover { filter: none; }
 
 @media (max-width: 900px) {
   .publishbar { position: static; flex-wrap: wrap; }
