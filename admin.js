@@ -292,6 +292,14 @@ function hours(s) {
 }
 function isOvernight(s) { return s.end <= s.start; }
 function isNight(s) { return s.start >= '18:00' || isOvernight(s); }
+/* absolute minutes for rest math (overnight shifts end on the next calendar day) */
+function absMin(iso, hhmm) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const [h, mm] = hhmm.split(':').map(Number);
+  return Date.UTC(y, m - 1, d, h, mm) / 60000;
+}
+function shiftEndMin(s) { return absMin(isOvernight(s) ? addDays(s.date, 1) : s.date, s.end); }
+const MIN_REST_MIN = 10 * 60;   // ≥10h between a shift's end and the next start — blocks mid→early-day and night→day
 function isWeekendDate(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   const day = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
@@ -1351,17 +1359,11 @@ function runGeneration(site, mo) {
   const reqs = requestsFor(site, mo);
   const profiles = timeProfiles();
   const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
-  const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), prof: profiles.get(p.who) || null }]));
-  const overnights = new Map();
-  const markOvernight = (who, date) => {
-    if (!overnights.has(who)) overnights.set(who, new Set());
-    overnights.get(who).add(date);
-  };
+  const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
   for (const s of all) {
     if (!s.who || !s.date.startsWith(mo)) continue;
     const st = stats.get(s.who);
-    if (st) st.dates.add(s.date);
-    if (isOvernight(s)) markOvernight(s.who, s.date);
+    if (st) { st.dates.add(s.date); st.shiftByDate.set(s.date, s); }
   }
   const assignments = [];
   const unfilled = [];
@@ -1377,7 +1379,8 @@ function runGeneration(site, mo) {
       const cap = (r && r.cap) || p.target + 1;                                  // hard: never more than 1 over their average/target
       if (st.assigned >= cap) { if (r && r.cap) capsHit.add(p.who); continue; }
       if (st.dates.has(slot.date)) continue;                                     // hard: one shift/day
-      if (slot.start < '12:00' && overnights.get(p.who)?.has(addDays(slot.date, -1))) continue;  // hard: rest after overnight
+      const prevShift = st.shiftByDate.get(addDays(slot.date, -1));              // hard: ≥10h rest between shifts
+      if (prevShift && absMin(slot.date, slot.start) - shiftEndMin(prevShift) < MIN_REST_MIN) continue;
       let run = 0;
       for (let k = 1; k <= maxRun; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
       if (run >= maxRun) continue;                                               // hard: max consecutive days (assistant-tunable, default 5)
@@ -1400,7 +1403,7 @@ function runGeneration(site, mo) {
     st.assigned++;
     if (preferred) st.preferGot++;
     st.dates.add(slot.date);
-    if (isOvernight(slot)) markOvernight(best.who, slot.date);
+    st.shiftByDate.set(slot.date, slot);
   }
   for (const st of stats.values()) {
     let bestRun = 0;
@@ -2000,9 +2003,118 @@ function openRulesDialog() {
   });
 }
 
+/* ---------- manual edits to a generated proposal ----------
+   These mutate the in-memory proposal (g.result); regenerating rebuilds from
+   scratch, same as the chat "move" command. */
+
+function ensureStat(res, who) {
+  let st = res.stats.get(who);
+  if (st) return st;
+  st = { who, role: providerRole({ pos: '', who }) || 'ANY', target: 0, avg: 0, fromAvg: false, float: false,
+    assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: timeProfiles().get(who) || null, longestRun: 0, tod: null };
+  res.stats.set(who, st);
+  return st;
+}
+
+function recomputeProposalDerived(res) {
+  for (const st of res.stats.values()) {
+    let best = 0;
+    for (const d of st.dates) {
+      if (st.dates.has(addDays(d, -1))) continue;
+      let len = 1;
+      while (st.dates.has(addDays(d, len))) len++;
+      best = Math.max(best, len);
+    }
+    st.longestRun = best;
+  }
+  res.preferGot = [...res.stats.values()].reduce((a, s) => a + (s.preferGot || 0), 0);
+}
+
+function removeFromSlot(res, slot) {
+  const a = res.assignments.find(x => x.slot === slot);
+  if (!a) return;
+  const st = res.stats.get(a.who);
+  if (st) { st.assigned--; st.dates.delete(slot.date); st.shiftByDate?.delete(slot.date); if (a.preferred) st.preferGot--; }
+  res.assignments = res.assignments.filter(x => x !== a);
+  res.unfilled.push(slot);
+  audit(`Proposal edit: opened up ${describeShift(slot)} (was ${a.who})`, 'ai');
+}
+
+function addToSlot(res, slot, who) {
+  res.unfilled = res.unfilled.filter(s => s !== slot);
+  const r = res.reqs.get(who);
+  const preferred = !!(r && r.prefer.has(slot.date));
+  res.assignments.push({ slot, who, preferred });
+  const st = ensureStat(res, who);
+  st.assigned++; st.dates.add(slot.date); st.shiftByDate?.set(slot.date, slot); if (preferred) st.preferGot++;
+  audit(`Proposal edit: assigned ${who} to ${describeShift(slot)}`, 'ai');
+}
+
+/* who could legally take this open slot, given the current proposal state */
+function proposalCandidates(res, slot) {
+  const need = slotRole(slot.pos);
+  const bucket = shiftBucket(slot);
+  const out = [];
+  for (const st of res.stats.values()) {
+    if (need !== 'ANY' && st.role !== 'ANY' && st.role !== need) continue;
+    const r = res.reqs.get(st.who);
+    const warn = [];
+    if (st.dates.has(slot.date)) continue;                                    // already works that day — never valid
+    if (r && r.off.has(slot.date)) warn.push('marked off');
+    const prev = st.shiftByDate?.get(addDays(slot.date, -1));
+    if (prev && absMin(slot.date, slot.start) - shiftEndMin(prev) < MIN_REST_MIN) warn.push('<10h rest');
+    if (st.tod && bucket !== st.tod) warn.push(`usually ${st.tod}s`);
+    else if (!st.tod && st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) warn.push('off-pattern time');
+    const cap = (r && r.cap) || st.target + 1;
+    const over = st.assigned >= cap;
+    out.push({ who: st.who, assigned: st.assigned, target: st.target, over, warn: warn.join(' · ') });
+  }
+  return out.sort((a, b) =>
+    (a.warn ? 1 : 0) - (b.warn ? 1 : 0) ||
+    (a.over ? 1 : 0) - (b.over ? 1 : 0) ||
+    a.assigned - b.assigned ||
+    a.who.localeCompare(b.who));
+}
+
+function openSlotPicker(res, slot) {
+  openModal('picker-modal', (body, close) => {
+    body.append(el('h2', '', `Fill ${fmtDateLong(slot.date)} · ${slot.start}–${slot.end}`));
+    body.append(el('div', 'reqhint', `${slot.pos} at ${siteName(slot.site)} — pick who works it. Clean fits are listed first; ⚠ ones break a rule but you can override.`));
+    const cands = proposalCandidates(res, slot);
+    const list = el('div', 'pickerlist');
+    if (!cands.length) list.append(el('div', 'approval-empty', 'No one in the pool can take this slot. Add a provider from the rules dialog first.'));
+    for (const c of cands.slice(0, 16)) {
+      const row = el('button', 'pickeritem' + (c.warn || c.over ? ' warn' : ''));
+      row.type = 'button';
+      row.append(el('span', 'pickname', c.who));
+      const meta = [`${c.assigned}/${c.target}`];
+      if (c.over) meta.push('at cap');
+      if (c.warn) meta.push('⚠ ' + c.warn);
+      row.append(el('span', 'pickmeta', meta.join(' · ')));
+      row.onclick = () => {
+        addToSlot(res, slot, c.who);
+        recomputeProposalDerived(res);
+        state.gen.applied = false;
+        saveOverlay();
+        close();
+        render();
+      };
+      list.append(row);
+    }
+    body.append(list);
+    const act = el('div', 'dialog-actions');
+    act.append(el('span', 'spacer'));
+    const cancel = el('button', '', 'Close');
+    cancel.type = 'button';
+    cancel.onclick = close;
+    act.append(cancel);
+    body.append(act);
+  });
+}
+
 /* ---------- generate view ---------- */
 
-/* month-calendar preview of a generated proposal (read-only) */
+/* month-calendar preview of a generated proposal (assigned chips removable, OPEN chips fillable) */
 function renderProposalCalendar(wrap, res) {
   const rf = state.gen.roleFilter;
   const box = el('div', 'reqform');
@@ -2023,7 +2135,7 @@ function renderProposalCalendar(wrap, res) {
   pm.append(el('span', 'prefmark', '✓'));
   pm.append(document.createTextNode(' = preferred day granted'));
   legend.append(pm);
-  legend.append(el('span', '', 'Click physicians or APCs to filter the view.'));
+  legend.append(el('span', '', 'Click a role to filter · click a name to open the shift · click OPEN to fill it.'));
   box.append(legend);
 
   const keep = slot => !rf || slotRole(slot.pos) === rf || slotRole(slot.pos) === 'ANY';
@@ -2068,7 +2180,22 @@ function renderProposalCalendar(wrap, res) {
       const who = el('span', 'who', it.who ? it.who.replace(/,.*$/, '') : 'OPEN');
       if (it.preferred) who.append(el('span', 'prefmark', ' ✓'));
       b.append(who);
-      b.title = `${s.start}–${s.end} · ${s.pos} · ${it.who || 'OPEN'}${it.preferred ? ' · preferred day granted' : ''}`;
+      if (it.who) {
+        b.classList.add('editable');
+        b.title = `${s.start}–${s.end} · ${s.pos} · ${it.who}${it.preferred ? ' · preferred day granted' : ''}\nClick to remove — the shift opens back up.`;
+        b.onclick = () => {
+          if (!confirm(`Open up this shift?\n\n${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos}\n\nRemoves ${it.who}; the slot becomes OPEN.`)) return;
+          removeFromSlot(res, s);
+          recomputeProposalDerived(res);
+          state.gen.applied = false;
+          saveOverlay();
+          render();
+        };
+      } else {
+        b.classList.add('editable');
+        b.title = `Open ${s.pos} · ${s.start}–${s.end}\nClick to assign someone.`;
+        b.onclick = () => openSlotPicker(res, s);
+      }
       td.append(b);
     }
     if (cell.length > COLLAPSED_CHIPS) {
@@ -2208,7 +2335,7 @@ function renderGenerate(main) {
     if (res.capsHit.length) bullet(`Shift caps held: ${res.capsHit.map(n => n.replace(/,.*$/, '')).join(', ')} stopped at their requested maximums.`);
     const runners = [...res.stats.values()].filter(s => s.longestRun >= 3).sort((a, b) => b.longestRun - a.longestRun).slice(0, 2);
     for (const r of runners) bullet(`Block scheduling: ${r.who.replace(/,.*$/, '')} works up to ${r.longestRun} consecutive days rather than scattered singles.`);
-    bullet(`No overnight-into-morning turnarounds and no stretches over ${res.maxRun} days, by rule.`);
+    bullet(`At least 10 hours off between shifts — no mid-to-morning (e.g. 11:00–23:00 then a 06:00 start) and no night-to-day flips — and no stretches over ${res.maxRun} days, by rule.`);
     for (const r of [...res.reqs.values()].filter(r => r.note && !r.off.size && !r.prefer.size && !r.cap)) {
       bullet(`Noted but not auto-enforced: ${r.who.replace(/,.*$/, '')} — “${r.note}”.`);
     }
