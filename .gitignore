@@ -7,3 +7,4 @@ data/save-week.ps1
 # Local OS/editor noise.
 .DS_Store
 Thumbs.db
+.claude/
