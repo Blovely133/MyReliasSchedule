@@ -3399,6 +3399,295 @@ function confirmModal({ title, body, confirmLabel, danger, onConfirm }) {
   });
 }
 
+/* ---------- the big red button (someone always clicks it) ---------- */
+
+let mechShowRunning = false;
+
+function unleashMech() {
+  if (mechShowRunning) return;
+  mechShowRunning = true;
+  const btn = $('#dontClickBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '☢ EVACUATE'; }
+  audit('🤖 The "Don\'t Click" button was clicked. Mech deployed. This is on the record.', 'denial');
+  saveOverlay();
+
+  const cv = document.createElement('canvas');
+  cv.className = 'mech-overlay';
+  document.body.append(cv);
+  const ctx = cv.getContext('2d');
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  let W = innerWidth, H = innerHeight;
+  const fit = () => { W = innerWidth; H = innerHeight; cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); };
+  fit();
+  window.addEventListener('resize', fit);
+  if (!matchMedia('(prefers-reduced-motion: reduce)').matches) document.body.classList.add('mech-shake');
+
+  /* synth booms — no audio assets, degrades to silence */
+  let ac = null, master = null;
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.resume) ac.resume();
+    master = ac.createGain(); master.gain.value = 0.22; master.connect(ac.destination);
+  } catch {}
+  function boomSound(intensity) {
+    if (!ac) return;
+    try {
+      const t = ac.currentTime, dur = 0.4 + 0.3 * intensity;
+      const buf = ac.createBuffer(1, Math.max(1, Math.floor(ac.sampleRate * dur)), ac.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length) ** 2;
+      const src = ac.createBufferSource(); src.buffer = buf;
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(300 + 900 * intensity, t);
+      lp.frequency.exponentialRampToValueAtTime(60, t + dur);
+      const g = ac.createGain();
+      g.gain.setValueAtTime(Math.min(1, 0.85 * intensity), t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      src.connect(lp); lp.connect(g); g.connect(master);
+      const osc = ac.createOscillator(); osc.type = 'sine';
+      const og = ac.createGain();
+      osc.frequency.setValueAtTime(110 + 70 * intensity, t);
+      osc.frequency.exponentialRampToValueAtTime(30, t + dur * 0.8);
+      og.gain.setValueAtTime(0.55 * intensity, t);
+      og.gain.exponentialRampToValueAtTime(0.001, t + dur * 0.8);
+      osc.connect(og); og.connect(master);
+      src.start(t); osc.start(t); osc.stop(t + dur); src.stop(t + dur);
+    } catch {}
+  }
+
+  /* particles */
+  const flashes = [], rings = [], sparks = [], smoke = [], shots = [];
+  const SPARK_COLORS = ['#fff7c8', '#ffd166', '#ff8c42', '#ff4d3d'];
+  function explode(x, y, power, quiet) {
+    flashes.push({ x, y, r: 46 * power, t: 0, dur: 0.16 });
+    rings.push({ x, y, r0: 12 * power, r1: 120 * power, t: 0, dur: 0.45 });
+    for (let i = Math.round(26 * power); i > 0; i--) {
+      const a = Math.random() * Math.PI * 2, sp = (180 + Math.random() * 520) * Math.sqrt(power);
+      sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 120, size: 2 + Math.random() * 3.5, t: 0, dur: 0.45 + Math.random() * 0.5, c: SPARK_COLORS[Math.random() * 4 | 0] });
+    }
+    for (let i = Math.round(6 * power); i > 0; i--) {
+      smoke.push({ x: x + (Math.random() - 0.5) * 30 * power, y: y + (Math.random() - 0.5) * 20 * power, vy: -25 - Math.random() * 35, size: 14 + Math.random() * 20 * power, t: 0, dur: 1 + Math.random() * 0.5 });
+    }
+    if (sparks.length > 900) sparks.splice(0, sparks.length - 900);
+    if (!quiet) boomSound(Math.min(1.4, 0.45 + 0.5 * power));
+  }
+
+  /* the mech — chunky biped in console colors, rises from below then stomps across */
+  const mechH = Math.min(H * 0.42, 360);
+  const u = mechH / 200;
+  const GUN_A = -0.62;
+  const mech = { x: Math.max(120, W * 0.28), phase: 0, lastStep: 1, muzzle: -9, nextFire: 2.6 };
+  const walkSpeed = (W - mech.x + 220 * u) / 6.8;
+  const DARK = '#252b34', MID = '#39424f', LIGHT = '#4a5462', CYAN = '#00bedd', YELLOW = '#f7c948';
+
+  function panel(x, y, w, h, fill) {
+    ctx.fillStyle = fill; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  }
+  function joint(r, fill) { ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fillStyle = fill; ctx.fill(); }
+  function leg(hipX, swing, knee) {
+    ctx.save();
+    ctx.translate(hipX, -100 * u); ctx.rotate(swing);
+    panel(-8 * u, 0, 16 * u, 54 * u, MID); joint(6 * u, DARK);
+    ctx.translate(0, 54 * u); ctx.rotate(knee);
+    panel(-6.5 * u, 0, 13 * u, 42 * u, LIGHT); joint(5 * u, CYAN);
+    ctx.translate(0, 42 * u); ctx.rotate(-(swing + knee));
+    panel(-11 * u, 0, 32 * u, 9 * u, DARK);
+    ctx.restore();
+  }
+  function drawMech(t, gy) {
+    const ph = mech.phase;
+    const bob = Math.sin(ph * 2) * 2.5 * u;
+    ctx.save();
+    ctx.translate(mech.x, gy);
+    leg(-16 * u, Math.sin(ph) * 0.42, 0.16 + 0.3 * Math.max(0, Math.sin(ph + 1)));
+    leg(16 * u, Math.sin(ph + Math.PI) * 0.42, 0.16 + 0.3 * Math.max(0, Math.sin(ph + Math.PI + 1)));
+    ctx.save();
+    ctx.translate(0, bob);
+    /* rear arm with claw */
+    ctx.save();
+    ctx.translate(-52 * u, -150 * u); ctx.rotate(0.35 + Math.sin(ph + Math.PI) * 0.25);
+    panel(-7 * u, 0, 14 * u, 34 * u, MID);
+    ctx.translate(0, 34 * u); ctx.rotate(0.5);
+    panel(-6 * u, 0, 12 * u, 30 * u, LIGHT);
+    panel(-6 * u, 30 * u, 5 * u, 10 * u, DARK);
+    panel(1 * u, 30 * u, 5 * u, 10 * u, DARK);
+    ctx.restore();
+    /* torso, vents, core */
+    panel(-46 * u, -168 * u, 92 * u, 72 * u, MID);
+    panel(-46 * u, -168 * u, 92 * u, 8 * u, LIGHT);
+    for (let i = 0; i < 3; i++) panel(-30 * u + i * 22 * u, -112 * u, 16 * u, 4.5 * u, DARK);
+    ctx.save();
+    ctx.shadowColor = CYAN; ctx.shadowBlur = 14;
+    ctx.beginPath(); ctx.arc(0, -136 * u, (8 + Math.sin(t * 4) * 1.6) * u, 0, 7);
+    ctx.fillStyle = CYAN; ctx.fill();
+    ctx.restore();
+    /* pauldrons, hazard stripes on the gun side */
+    panel(-78 * u, -164 * u, 30 * u, 22 * u, LIGHT);
+    panel(48 * u, -164 * u, 30 * u, 22 * u, LIGHT);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(48 * u, -164 * u, 30 * u, 22 * u); ctx.clip();
+    ctx.fillStyle = YELLOW;
+    for (let i = 0; i < 3; i++) {
+      ctx.save(); ctx.translate((52 + i * 10) * u, -164 * u); ctx.rotate(0.75); ctx.fillRect(0, -4 * u, 5 * u, 34 * u); ctx.restore();
+    }
+    ctx.restore();
+    /* head: visor scan, antenna blink */
+    panel(-22 * u, -194 * u, 44 * u, 26 * u, LIGHT);
+    panel(-16 * u, -186 * u, 32 * u, 8 * u, '#0a1420');
+    const scan = -16 * u + 22 * u * (0.5 + 0.5 * Math.sin(t * 2.6));
+    ctx.save(); ctx.shadowColor = CYAN; ctx.shadowBlur = 12;
+    ctx.fillStyle = CYAN; ctx.fillRect(scan, -186 * u, 10 * u, 8 * u);
+    ctx.restore();
+    ctx.strokeStyle = LIGHT; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(14 * u, -194 * u); ctx.lineTo(21 * u, -212 * u); ctx.stroke();
+    if (Math.sin(t * 6) > 0) { ctx.beginPath(); ctx.arc(21 * u, -213 * u, 2.6 * u, 0, 7); ctx.fillStyle = '#ff4d4d'; ctx.fill(); }
+    /* gatling arm */
+    ctx.save();
+    ctx.translate(52 * u, -150 * u); ctx.rotate(0.45);
+    panel(-7 * u, 0, 14 * u, 20 * u, MID);
+    ctx.translate(0, 20 * u); ctx.rotate(GUN_A - 0.45);
+    panel(0, -9 * u, 58 * u, 18 * u, DARK);
+    panel(0, -9 * u, 58 * u, 4 * u, MID);
+    ctx.translate(58 * u, 0);
+    joint(8 * u, LIGHT);
+    const spin = (t - mech.muzzle < 0.6 ? t * 26 : t * 2);
+    for (let i = 0; i < 4; i++) {
+      const a = spin + i * Math.PI / 2;
+      ctx.beginPath(); ctx.arc(Math.cos(a) * 4.5 * u, Math.sin(a) * 4.5 * u, 2.6 * u, 0, 7);
+      ctx.fillStyle = DARK; ctx.fill();
+    }
+    if (t - mech.muzzle < 0.09) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = '#fff2b8';
+      ctx.beginPath(); ctx.moveTo(2 * u, -3 * u); ctx.lineTo(26 * u, 0); ctx.lineTo(2 * u, 3 * u); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-3 * u, -12 * u); ctx.lineTo(0, 12 * u); ctx.lineTo(3 * u, -12 * u); ctx.closePath(); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    ctx.restore();
+    ctx.restore();
+    ctx.restore();
+  }
+
+  /* timeline */
+  const startMs = performance.now();
+  let lastMs = startMs, nextBoom = 0.05, endAt = 10.2, curT = 0, raf = 0;
+
+  function teardown() {
+    cancelAnimationFrame(raf);
+    window.removeEventListener('resize', fit);
+    window.removeEventListener('keydown', onKey);
+    document.body.classList.remove('mech-shake');
+    cv.remove();
+    if (ac) { try { ac.close(); } catch {} }
+    if (btn) { btn.disabled = false; btn.textContent = "Don't Click"; btn.title = 'You know exactly what happens.'; }
+    mechShowRunning = false;
+  }
+  function onKey(e) { if (e.key === 'Escape') endAt = Math.min(endAt, curT + 0.3); }
+  window.addEventListener('keydown', onKey);
+  cv.addEventListener('click', () => { endAt = Math.min(endAt, curT + 0.3); });
+
+  function frame(nowMs) {
+    const t = curT = (nowMs - startMs) / 1000;
+    const dt = Math.min(0.033, (nowMs - lastMs) / 1000); lastMs = nowMs;
+    ctx.clearRect(0, 0, W, H);
+
+    if (t >= nextBoom && t < endAt - 0.9) {
+      explode(50 + Math.random() * (W - 100), 50 + Math.random() * H * 0.72, 0.7 + Math.random() * 1.1, false);
+      nextBoom = t + (t < 6.5 ? 0.2 + Math.random() * 0.28 : 0.45 + Math.random() * 0.5);
+    }
+
+    const gy = H - 8;
+    const rise = Math.max(0, Math.min(1, (t - 1.1) / 1.3));
+    const eased = 1 - (1 - rise) ** 3;
+    const gyDraw = gy + (1 - eased) * mechH * 1.2;
+    if (rise > 0 && rise < 1 && Math.random() < 0.3) {
+      explode(mech.x + (Math.random() - 0.5) * 150, gy - Math.random() * 36, 0.6, Math.random() < 0.75);
+    }
+    if (rise >= 1) {
+      mech.x += walkSpeed * dt;
+      mech.phase += dt * 5.4;
+      const s = Math.sign(Math.sin(mech.phase)) || 1;
+      if (s !== mech.lastStep) {
+        mech.lastStep = s;
+        boomSound(0.22);
+        smoke.push({ x: mech.x + s * 16 * u, y: gy - 4, vy: -18, size: 10, t: 0, dur: 0.5 });
+      }
+      if (t >= mech.nextFire && t < endAt - 1.3 && mech.x < W - 60) {
+        mech.nextFire = t + 0.85 + Math.random() * 0.75;
+        mech.muzzle = t;
+        boomSound(0.5);
+        const bobNow = Math.sin(mech.phase * 2) * 2.5 * u;
+        const ex = mech.x + 52 * u - Math.sin(0.45) * 20 * u;
+        const ey = gy + bobNow - 150 * u + Math.cos(0.45) * 20 * u;
+        shots.push({ x0: ex + Math.cos(GUN_A) * 58 * u, y0: ey + Math.sin(GUN_A) * 58 * u, tx: Math.random() * W, ty: 40 + Math.random() * H * 0.45, t0: t, dur: 0.22 });
+      }
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+    for (let i = smoke.length - 1; i >= 0; i--) {
+      const p = smoke[i]; p.t += dt;
+      const k = p.t / p.dur;
+      if (k >= 1) { smoke.splice(i, 1); continue; }
+      p.y += p.vy * dt; p.size += 26 * dt;
+      ctx.globalAlpha = 0.22 * (1 - k);
+      ctx.fillStyle = '#8d99a6';
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    if (rise > 0) drawMech(t, gyDraw);
+
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = shots.length - 1; i >= 0; i--) {
+      const sh = shots[i]; const k = (t - sh.t0) / sh.dur;
+      if (k >= 1) { shots.splice(i, 1); explode(sh.tx, sh.ty, 0.9 + Math.random() * 0.6, false); continue; }
+      const hx = sh.x0 + (sh.tx - sh.x0) * k, hy = sh.y0 + (sh.ty - sh.y0) * k;
+      const bx = sh.x0 + (sh.tx - sh.x0) * Math.max(0, k - 0.18), by = sh.y0 + (sh.ty - sh.y0) * Math.max(0, k - 0.18);
+      ctx.strokeStyle = 'rgba(140,240,255,.9)'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(hx, hy); ctx.stroke();
+    }
+    for (let i = flashes.length - 1; i >= 0; i--) {
+      const f = flashes[i]; f.t += dt; const k = f.t / f.dur;
+      if (k >= 1) { flashes.splice(i, 1); continue; }
+      const r = f.r * (0.5 + 2.6 * k);
+      const gr = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, r);
+      gr.addColorStop(0, `rgba(255,255,230,${0.9 * (1 - k)})`);
+      gr.addColorStop(0.4, `rgba(255,170,70,${0.55 * (1 - k)})`);
+      gr.addColorStop(1, 'rgba(255,80,40,0)');
+      ctx.fillStyle = gr;
+      ctx.beginPath(); ctx.arc(f.x, f.y, r, 0, 7); ctx.fill();
+    }
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const rg = rings[i]; rg.t += dt; const k = rg.t / rg.dur;
+      if (k >= 1) { rings.splice(i, 1); continue; }
+      ctx.strokeStyle = `rgba(255,210,140,${0.8 * (1 - k)})`;
+      ctx.lineWidth = 1 + 3 * (1 - k);
+      ctx.beginPath(); ctx.arc(rg.x, rg.y, rg.r0 + (rg.r1 - rg.r0) * k, 0, 7); ctx.stroke();
+    }
+    for (let i = sparks.length - 1; i >= 0; i--) {
+      const p = sparks[i]; p.t += dt; const k = p.t / p.dur;
+      if (k >= 1) { sparks.splice(i, 1); continue; }
+      p.vy += 700 * dt; p.vx *= 1 - 1.6 * dt; p.vy *= 1 - 0.4 * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.c;
+      ctx.fillRect(p.x, p.y, p.size * (1 - k * 0.6), p.size * (1 - k * 0.6));
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+
+    cv.style.opacity = String(Math.max(0, Math.min(1, (endAt - t) / 0.55)));
+    if (t >= endAt) { teardown(); return; }
+    raf = requestAnimationFrame(frame);
+  }
+  raf = requestAnimationFrame(frame);
+  explode(W * 0.5, H * 0.4, 1.4, false);
+  explode(W * 0.22, H * 0.6, 1, true);
+  explode(W * 0.78, H * 0.3, 1, true);
+}
+
 /* enter / modify a single provider's requests on a clickable month calendar */
 function openRequestEditor(initialWho) {
   const g = state.gen;
@@ -4620,6 +4909,7 @@ function wireChrome() {
   $('#searchBox').oninput = e => { state.search = e.target.value; render(); };
   $('#exportCsvBtn').onclick = exportCsv;
   $('#printBtn').onclick = () => print();
+  $('#dontClickBtn').onclick = unleashMech;
   $('#bellBtn').onclick = toggleBell;
   document.addEventListener('click', e => {
     if (notifOpen && !e.target.closest('#notifPanel') && !e.target.closest('#bellBtn')) {

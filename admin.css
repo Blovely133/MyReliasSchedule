@@ -185,6 +185,37 @@ table.cov th.sitecol .sitesub { display: block; font-size: 10.5px; color: var(--
 .suggestbox:empty { display: none; }
 .suggestbox .sughead { font-size: 11.5px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
 .suggestbox .pastwarn { font-size: 12px; color: #ffd98a; border: 1px solid var(--rh-yellow); border-radius: 8px; padding: 6px 9px; margin-bottom: 8px; }
+
+/* ---- the big red button (do not click) ---- */
+.top-actions .dontclick {
+  background: #e5484d;
+  border: 1px solid #ff6b6e;
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: .3px;
+  cursor: pointer;
+  animation: dontclick-pulse 2.2s ease-in-out infinite;
+}
+.top-actions .dontclick:hover { background: #ff5a5f; color: #fff; border-color: #ff8a8d; }
+.top-actions .dontclick:disabled { opacity: .8; cursor: default; animation: none; }
+@keyframes dontclick-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(229 72 77 / .55); }
+  50% { box-shadow: 0 0 0 8px rgb(229 72 77 / 0); }
+}
+.mech-overlay { position: fixed; inset: 0; z-index: 9999; }
+body.mech-shake { animation: mech-shake .28s linear infinite; }
+@keyframes mech-shake {
+  0% { transform: translate(0, 0); }
+  20% { transform: translate(-5px, 3px); }
+  40% { transform: translate(4px, -4px); }
+  60% { transform: translate(-3px, -3px); }
+  80% { transform: translate(5px, 2px); }
+  100% { transform: translate(0, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .top-actions .dontclick { animation: none; }
+  body.mech-shake { animation: none; }
+}
 .suggestbtn {
   margin: 0 6px 6px 0;
   padding: 4px 10px;
