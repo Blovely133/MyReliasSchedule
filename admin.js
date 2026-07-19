@@ -3359,29 +3359,69 @@ function proposalCandidates(res, slot) {
 function openSlotPicker(res, slot) {
   openModal('picker-modal', (body, close) => {
     body.append(el('h2', '', `Fill ${fmtDateLong(slot.date)} · ${slot.start}–${slot.end}`));
-    body.append(el('div', 'reqhint', `${slot.pos} at ${siteName(slot.site)} — pick who works it. Clean fits are listed first; ⚠ ones break a rule but you can override.`));
+    body.append(el('div', 'reqhint', `${slot.pos} at ${siteName(slot.site)} — pick who works it. Best fits first; ⚠ ones break a rule but you can override. Search reaches everyone in the system, or type any new name.`));
+    const assign = who => {
+      addToSlot(res, slot, who);
+      recomputeProposalDerived(res);
+      state.gen.applied = false;
+      saveOverlay();
+      close();
+      render();
+    };
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'pickersearch';
+    search.placeholder = '🔍 Search anyone — or type a new name to add them…';
+    search.autocomplete = 'off';
+    body.append(search);
     const cands = proposalCandidates(res, slot);
+    const candWho = new Set(cands.map(c => c.who));
+    const everyone = [...new Set(base.filter(s => s.who).map(s => s.who))].sort();
     const list = el('div', 'pickerlist');
-    if (!cands.length) list.append(el('div', 'approval-empty', 'No one in the pool can take this slot. Add a provider from the rules dialog first.'));
-    for (const c of cands.slice(0, 16)) {
-      const row = el('button', 'pickeritem' + (c.warn || c.over ? ' warn' : ''));
-      row.type = 'button';
-      row.append(el('span', 'pickname', c.who));
-      const meta = [`${c.assigned}/${c.target}`];
-      if (c.over) meta.push('at cap');
-      if (c.warn) meta.push('⚠ ' + c.warn);
-      row.append(el('span', 'pickmeta', meta.join(' · ')));
-      row.onclick = () => {
-        addToSlot(res, slot, c.who);
-        recomputeProposalDerived(res);
-        state.gen.applied = false;
-        saveOverlay();
-        close();
-        render();
-      };
-      list.append(row);
-    }
     body.append(list);
+    const rowBtn = (who, metaText, warn) => {
+      const row = el('button', 'pickeritem' + (warn ? ' warn' : ''));
+      row.type = 'button';
+      row.append(el('span', 'pickname', who));
+      row.append(el('span', 'pickmeta', metaText));
+      row.onclick = () => assign(who);
+      return row;
+    };
+    const paint = () => {
+      list.innerHTML = '';
+      const raw = search.value.trim();
+      const q = raw.toLowerCase();
+      const matches = q ? cands.filter(c => c.who.toLowerCase().includes(q)) : cands;
+      if (matches.length) list.append(el('div', 'pickerlabel', 'Best fits from this roster'));
+      for (const c of matches.slice(0, q ? 8 : 16)) {
+        const meta = [`${c.assigned}/${c.target}`];
+        if (c.over) meta.push('at cap');
+        if (c.warn) meta.push('⚠ ' + c.warn);
+        list.append(rowBtn(c.who, meta.join(' · '), c.warn || c.over));
+      }
+      if (q) {
+        const rest = everyone.filter(w => !candWho.has(w) && w.toLowerCase().includes(q)).slice(0, 8);
+        if (rest.length) {
+          list.append(el('div', 'pickerlabel', 'Everyone in the system'));
+          const all = adminShifts();
+          for (const w of rest) {
+            const busy = all.some(s => s.who === w && s.date === slot.date);
+            list.append(rowBtn(w, busy ? '⚠ already works that day' : 'not in this site’s pool', busy));
+          }
+        }
+        const known = candWho.has(raw) || everyone.some(w => w.toLowerCase() === q) || matches.some(c => c.who.toLowerCase() === q);
+        if (!known && raw.length >= 3) {
+          list.append(el('div', 'pickerlabel', 'New name'));
+          list.append(rowBtn(raw, '➕ assign as typed — new to the system', false));
+        }
+        if (!matches.length && !rest.length && raw.length < 3) list.append(el('div', 'approval-empty', 'No matches — keep typing (3+ letters lets you add a brand-new name).'));
+      } else if (!cands.length) {
+        list.append(el('div', 'approval-empty', 'No one in the pool can take this slot cleanly — search above for anyone in the system, or type a new name.'));
+      }
+    };
+    search.oninput = paint;
+    paint();
+    setTimeout(() => search.focus(), 0);
     const act = el('div', 'dialog-actions');
     act.append(el('span', 'spacer'));
     const cancel = el('button', '', 'Close');

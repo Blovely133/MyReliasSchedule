@@ -433,6 +433,21 @@ table.flat th.sorted { color: var(--rh-yellow); }
 }
 .rosterlabel { margin-top: 14px; font-weight: 600; }
 
+/* ---- slot picker: search anyone / free-type ---- */
+.pickersearch {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 10px 0 8px;
+  padding: 9px 12px;
+  font-size: 14px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+}
+.pickersearch:focus { border-color: var(--rh-yellow); outline: none; }
+.pickerlabel { margin: 10px 2px 4px; font-size: 12px; font-weight: 600; color: var(--muted, #9aa4b2); text-transform: uppercase; letter-spacing: 0.04em; }
+
 /* ---- proposal repair: clear provider + refill opens ---- */
 .refillrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 4px 0 12px; }
 .refillrow .reqhint { flex: 1 1 260px; margin: 0; }
