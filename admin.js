@@ -1252,8 +1252,9 @@ async function backendCall(path, payload) {
 }
 
 /* ---------- AI schedule generation ----------
-   The reconciliation engine runs live in the browser (deterministic greedy
-   with hard rules + scoring). Example request lists are seeded for NMMC-Tupelo
+   Placement runs live in the browser: the HiGHS MILP optimizer (further down)
+   is the real engine, with the deterministic greedy engine as instant preview
+   and fallback. Example request lists are seeded for NMMC-Tupelo
    and DCH-Northport; anything staff submit in the employee app merges in. */
 
 const EXAMPLE_SCHEDULING = {
@@ -2165,9 +2166,9 @@ const AGENT_TOOLS = [
     input_schema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
   { name: 'set_tier', description: 'Set a provider\'s employment tier: ft (full-time), pt (part-time), prn (as needed). Hierarchy: ft > pt > prn for shift preference; prn has no guaranteed load.',
     input_schema: { type: 'object', required: ['who', 'tier'], properties: { who: { type: 'string' }, tier: { type: 'string', enum: ['ft', 'pt', 'prn'] } } } },
-  { name: 'proposal_ops', description: 'Apply generation-pool operations (addProvider/removeProvider/addOff/addPrefer/setCap/setTarget/setTimeOfDay/maxRun/move) and rebuild the AI proposal. Same op shapes as before.',
+  { name: 'proposal_ops', description: 'Apply generation-pool operations (addProvider/removeProvider/addOff/addPrefer/setCap/setTarget/setTimeOfDay/maxRun/move) and rebuild the AI proposal with the HiGHS optimizer. Same op shapes as before.',
     input_schema: { type: 'object', required: ['ops'], properties: { ops: { type: 'array', items: { type: 'object' } } } } },
-  { name: 'run_generation', description: 'Rebuild the AI proposal for a site+month with the deterministic engine (honors all rules, requests, tiers). Returns fill stats and per-provider loads.',
+  { name: 'run_generation', description: 'Rebuild the AI proposal for a site+month with the HiGHS mixed-integer optimizer (in-browser WASM solver; guarantees all hard rules, globally optimizes coverage/floors/preferences; takes ~5–20s). Returns fill stats and per-provider loads. Use this for whole-month placement instead of hand-assigning shifts.',
     input_schema: { type: 'object', properties: { site: { type: 'string' }, month: { type: 'string' } } } },
   { name: 'get_drafts', description: 'List currently staged draft changes (edits/adds/removals) awaiting publish.',
     input_schema: { type: 'object', properties: {} } },
@@ -2179,7 +2180,7 @@ const AGENT_TOOLS = [
     input_schema: { type: 'object', properties: { limit: { type: 'integer' } } } },
 ];
 
-function agentToolExec(name, input) {
+async function agentToolExec(name, input) {
   const g = state.gen;
   const fmtRow = s => `${s.id} | ${s.date} ${s.start}–${s.end} | ${s.pos} | ${s.site || '—'} | ${s.who || 'OPEN'}${s.draft ? ' | DRAFT' : ''}${s.note ? ` | note: ${s.note}` : ''}`;
   try {
@@ -2246,16 +2247,19 @@ function agentToolExec(name, input) {
     }
     if (name === 'proposal_ops') {
       const n = applyBackendOps(input.ops || []);
-      if (n) { g.result = runGeneration(g.site, g.month); g.applied = false; }
-      return n ? `Applied ${n} ops; proposal rebuilt: ${g.result.assignments.length}/${g.result.slots} filled.` : 'No ops matched — check names/fields.';
+      if (n) { g.result = await runGenerationBest(g.site, g.month); g.applied = false; }
+      return n ? `Applied ${n} ops; proposal rebuilt by ${g.result.engine === 'milp' ? 'the HiGHS optimizer' : 'the greedy fallback engine'}: ${g.result.assignments.length}/${g.result.slots} filled.` : 'No ops matched — check names/fields.';
     }
     if (name === 'run_generation') {
       if (input.site) g.site = input.site;
       if (input.month) g.month = input.month;
-      g.result = runGeneration(g.site, g.month);
+      g.result = await runGenerationBest(g.site, g.month);
       g.applied = false;
       const under = g.result.underFloor.map(n2 => n2.replace(/,.*$/, '')).join(', ');
-      return `Proposal for ${siteName(g.site)} ${g.month}: ${g.result.assignments.length}/${g.result.slots} filled, ${g.result.unfilled.length} open.` +
+      const engine = g.result.engine === 'milp'
+        ? `HiGHS MILP optimizer (${g.result.solver.vars} vars, ${g.result.solver.status}, ${(g.result.solver.ms / 1000).toFixed(1)}s)`
+        : 'greedy fallback engine (optimizer unavailable)';
+      return `Proposal for ${siteName(g.site)} ${g.month} — placed by ${engine}: ${g.result.assignments.length}/${g.result.slots} filled, ${g.result.unfilled.length} open.` +
         (under ? ` Below floor: ${under}.` : ' Everyone at/above their floor.') + '\nLoads: ' +
         [...g.result.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned).map(s => `${s.who.replace(/,.*$/, '')} ${s.assigned}/${s.target}`).join(', ');
     }
@@ -2295,6 +2299,7 @@ function agentSystemPrompt() {
     `You are the scheduling copilot for Relias Healthcare's MyReliasSchedule console (currently viewing ${siteName(g.site)}, ${g.month}). The user is the scheduler; help with ANYTHING schedule-related: answer questions, analyze coverage/fairness, and make changes.`,
     `You have full control through your tools. Read before you write: check the schedule/roster with get_schedule/get_providers rather than assuming. Shift edits stage as DRAFTS the staff can't see; tell the user drafts are pending and that they (or you, if they say so) must publish. Only call publish_drafts or discard_drafts when the user explicitly asks.`,
     `House rules you must respect and can explain: nobody ends a month below their average minus one (PRN exempt); nobody above target+1; ≥10h rest between shifts; one shift/day; max-consecutive-days rule; keep people on their usual time of day; hierarchy full-time > part-time > PRN.`,
+    `Schedule placement is done by the HiGHS mixed-integer optimizer (a real MILP solver running in the browser), NOT by you and not by a greedy heuristic — run_generation/proposal_ops invoke it, and its result is provably optimal or near-optimal under the house rules. Never hand-place a whole month shift-by-shift; adjust the inputs (requests, caps, targets, tiers, rules) and re-run the optimizer. Individual swaps/edits via update_shift are fine. The tool result tells you which engine placed the proposal; "greedy fallback" appears only if the solver failed to load.`,
     `Site codes: ${Object.entries(SITE_NAMES).map(([c, n]) => `${c}=${n}`).join(', ')}.`,
     `Be concise and concrete — cite names, dates, and counts from tool results. If a request is ambiguous, ask.`,
   ].join('\n\n');
@@ -2317,7 +2322,7 @@ async function runAgentChat(text) {
     for (const c of calls) {
       pushChat('tool', `🔧 ${c.name}(${JSON.stringify(c.input).slice(0, 120)})`);
       if (MUTATING.has(c.name)) mutated = true;
-      results.push({ type: 'tool_result', tool_use_id: c.id, content: agentToolExec(c.name, c.input || {}) });
+      results.push({ type: 'tool_result', tool_use_id: c.id, content: await agentToolExec(c.name, c.input || {}) });
     }
     agentConvo.push({ role: 'user', content: results });
     saveOverlay();
@@ -2823,8 +2828,8 @@ function openBackendDialog() {
   });
 }
 
-/* Opus-4.8-driven generation: Claude sets targets + writes the rationale, the
-   deterministic engine places the shifts (all hard rules still guaranteed) */
+/* Opus-4.8-driven generation: Claude writes the analysis + rationale while the
+   HiGHS optimizer places the shifts in parallel (all hard rules guaranteed) */
 async function stageGenerateClaude() {
   const g = state.gen;
   g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
