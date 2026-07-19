@@ -1215,19 +1215,19 @@ function renderAudit(main) {
 
 const BACKEND_KEY = 'mrs-claude-backend';
 /* always-on default: the deployed Worker (URL is not a secret — the API key is
-   a Worker secret). A user-saved config overrides it; an explicit Disconnect
-   turns it off for that browser. */
+   a Worker secret). A user-saved config overrides it. There is deliberately no
+   disconnect path (owner request) — stale {disabled:true} entries from the old
+   UI are ignored, so every browser stays connected. */
 const DEFAULT_BACKEND_URL = 'https://shiftboard-claude.meadow-family-a291a2ba.workers.dev';
 function backendCfg() {
   let stored = null;
   try { stored = JSON.parse(localStorage.getItem(BACKEND_KEY) || 'null'); } catch {}
   if (stored && stored.url) return stored;          // user-saved config wins
-  if (stored && stored.disabled) return null;       // user explicitly disconnected
   return { url: DEFAULT_BACKEND_URL, token: '', isDefault: true };
 }
 function backendSet(cfg) {
   if (cfg && cfg.url) localStorage.setItem(BACKEND_KEY, JSON.stringify(cfg));
-  else localStorage.setItem(BACKEND_KEY, JSON.stringify({ disabled: true }));   // explicit disconnect
+  else localStorage.removeItem(BACKEND_KEY);        // empty save = back to the default Worker
 }
 function backendOn() { return Boolean(backendCfg()?.url); }
 
@@ -2359,13 +2359,13 @@ function openBackendDialog() {
             : 'Reached the Worker but it reported not-ok.';
         } catch (e) { status.textContent = '✗ Could not reach that URL. Check it and that the Worker is deployed.'; }
       };
-      const disc = el('button', 'danger', 'Disconnect');
-      disc.type = 'button';
-      disc.onclick = () => { backendSet(null); close(); render(); };
+      /* no Disconnect button by design — the owner wants the backend always on
+         so nobody unplugs Opus by accident; saving an empty URL just reverts
+         to the built-in default Worker */
       const save = el('button', 'primary', 'Save');
       save.type = 'button';
       save.onclick = () => { backendSet({ url: urlI.value.trim(), token: tokI.value.trim() }); close(); render(); };
-      actions.append(disc, el('span', 'spacer'), test, save);
+      actions.append(el('span', 'spacer'), test, save);
       body.append(actions);
     }
     paint();
