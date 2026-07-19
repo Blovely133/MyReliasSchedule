@@ -305,8 +305,7 @@ function hours(s) {
 function isOvernight(s) { return s.end <= s.start; }
 /* a night shift STARTS at night (18:00+, or a pre-dawn start). Merely running
    past midnight doesn't qualify — 17:00–03:00 is a swing/evening shift, and
-   handing it to a nights-only doc is exactly what the adversarial review
-   kept (correctly) flagging. */
+   must never be handed to a nights-only doc. */
 function isNight(s) { return s.start >= '18:00' || s.start < '04:00'; }
 /* absolute minutes for rest math (overnight shifts end on the next calendar day) */
 function absMin(iso, hhmm) {
@@ -2481,7 +2480,7 @@ async function stageGenerate() {
   if (backendOn()) return stageGenerateClaude();
   const g = state.gen;
   g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
-  g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null; g.review = null;
+  g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null;
   rebuildSeq++;   // invalidate any in-flight background rebuild
   render();
   const pool = poolFor(g.site, g.month);
@@ -3438,7 +3437,7 @@ function openBackendDialog() {
 async function stageGenerateClaude() {
   const g = state.gen;
   g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
-  g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null; g.review = null;
+  g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null;
   render();
   rebuildSeq++;   // invalidate any in-flight background rebuild
   const steps = ['Sending the roster and requests to Opus 4.8…', 'Opus 4.8 is reading the month…', 'HiGHS optimizer is placing the shifts…'];
@@ -3476,85 +3475,6 @@ async function stageGenerateClaude() {
   }
   g.result = res.status === 'fulfilled' ? res.value : runGeneration(g.site, g.month);
   g.running = false;
-  saveOverlay();
-  render();
-}
-
-/* ---------- adversarial review loop (Opus 4.8 at max effort) ---------- */
-
-const REVIEW_MAX_ROUNDS = 4;
-
-function buildReviewPayload(res, round, priorFlags) {
-  const g = state.gen;
-  const providers = [...res.stats.values()].map(st => {
-    const r = res.reqs.get(st.who);
-    const off = r ? [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)).join(',') : '';
-    const prefer = r ? [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)).join(',') : '';
-    return `${st.who} — ${st.role}; ${TIER_LABEL[tierOf(st.who, st.float)]}; target ${st.target}; assigned ${st.dates.size}; floor ${st.floor}; ` +
-      `${st.tod ? st.tod + 's (rule)' : usualShift(st.prof)}${off ? `; off ${off}` : ''}${prefer ? `; prefers ${prefer}` : ''}${r && r.cap ? `; cap ${r.cap}` : ''}`;
-  });
-  const assignments = res.assignments.map(a => `${a.slot.date} ${a.slot.start}–${a.slot.end} ${a.slot.pos} → ${a.who}`);
-  const unfilled = res.unfilled.slice(0, 60).map(s => `${s.date} ${s.start}–${s.end} ${s.pos}`);
-  return {
-    site: g.site, siteName: siteName(g.site), month: g.month, round,
-    rules: `max ${res.maxRun} consecutive days; at least 10h between shifts; one shift per day; nobody below their floor (target−1); nobody above target+1; honor off days and time-of-day patterns; shift-preference hierarchy Full-time > Part-time > PRN (PRN fills only what remains after higher tiers)`,
-    providers, assignments, unfilled, priorFlags,
-  };
-}
-
-async function runAdversarialReview() {
-  const g = state.gen;
-  if (!g.result || !backendOn() || (g.review && g.review.running)) return;
-  g.review = { running: true, rounds: [], round: 0 };
-  render();
-  let priorFlags = null;
-  try {
-    for (let round = 1; round <= REVIEW_MAX_ROUNDS; round++) {
-      g.review.round = round;
-      render();
-      const data = await backendCall('/api/review', buildReviewPayload(g.result, round, priorFlags));
-      const entry = { round, verdict: data.verdict, summary: data.summary, flags: data.flags || [], fixesApplied: 0 };
-      if (data.verdict === 'clean' || !entry.flags.length) {
-        entry.clean = true;
-        /* zero verifiable flags is the ground truth — drop a summary that
-           contradicts it (unsubstantiated suspicion reads as a real problem) */
-        if (data.verdict !== 'clean') entry.summary = '';
-        g.review.rounds.push(entry);
-        audit(`Adversarial review round ${round}: clean — no flags`, 'ai');
-        break;
-      }
-      /* apply fixes: pool-level ops force a regeneration, then moves patch the fresh proposal.
-         REJECT any fix that would cut a provider's target/cap below their current
-         target − 1 — the reviewer fixing an overload by lowballing someone else
-         is exactly how people ended up 3 shifts under their average. */
-      const baseline = new Map(poolFor(g.site, g.month).map(p => [p.who, p.target]));
-      const lowers = f => (f.kind === 'setCap' || f.kind === 'setTarget') && f.who && f.value != null &&
-        baseline.has(f.who) && f.value < Math.max(0, baseline.get(f.who) - 1);
-      const rejected = (data.fixes || []).filter(lowers);
-      const fixes = (data.fixes || []).filter(f => !lowers(f));
-      entry.rejected = rejected.length;
-      if (rejected.length) audit(`Adversarial review round ${round}: rejected ${rejected.length} fix${rejected.length === 1 ? '' : 'es'} that would cut providers below their average (${rejected.map(f => `${f.who.replace(/,.*$/, '')}→${f.value}`).join(', ')})`, 'ai');
-      const moves = fixes.filter(f => f.kind === 'move');
-      const poolOps = fixes.filter(f => f.kind !== 'move');
-      let applied = 0;
-      if (poolOps.length) {
-        applied += applyBackendOps(poolOps);
-        if (applied) { g.result = await runGenerationBest(g.site, g.month); g.applied = false; }
-      }
-      if (moves.length) applied += applyBackendOps(moves);
-      entry.fixesApplied = applied;
-      g.review.rounds.push(entry);
-      audit(`Adversarial review round ${round}: ${entry.flags.length} flag${entry.flags.length === 1 ? '' : 's'}, ${applied} fix${applied === 1 ? '' : 'es'} applied`, 'ai');
-      priorFlags = entry.flags.map(f => f.issue.slice(0, 160));
-      if (!applied) break;   // flags but nothing actionable — a 5th run won't differ
-    }
-  } catch (err) {
-    g.review.error = String(err.message || err);
-    audit(`Adversarial review failed: ${g.review.error}`, 'ai');
-  }
-  g.review.running = false;
-  const last = g.review.rounds[g.review.rounds.length - 1];
-  g.review.finalClean = !!(last && last.clean);
   saveOverlay();
   render();
 }
@@ -3713,7 +3633,7 @@ function renderGenerate(main) {
     if (s === g.site) o.selected = true;
     siteSel.append(o);
   }
-  siteSel.onchange = () => { g.site = siteSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; g.review = null; render(); };
+  siteSel.onchange = () => { g.site = siteSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
   const moSel = document.createElement('select');
   for (const m of months) {
     const o = el('option', '', fmtMonth(m));
@@ -3721,10 +3641,10 @@ function renderGenerate(main) {
     if (m === g.month) o.selected = true;
     moSel.append(o);
   }
-  moSel.onchange = () => { g.month = moSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; g.review = null; render(); };
+  moSel.onchange = () => { g.month = moSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
   const lb = (t, i) => { const l = el('label', '', t + ' '); l.append(i); return l; };
   row.append(lb('Site (★ = example requests seeded)', siteSel), lb('Month', moSel));
-  const goBtn = el('button', 'primary genbtn', g.running ? 'Generating…' : (backendOn() ? '✨ Generate with Opus 4.8' : '✨ Generate schedule'));
+  const goBtn = el('button', 'primary genbtn', g.running ? 'Generating…' : '✨ Generate Schedule');
   goBtn.disabled = g.running;
   goBtn.onclick = stageGenerate;
   row.append(goBtn);
@@ -3932,46 +3852,12 @@ function renderGenerate(main) {
     wrap.append(provBox);
 
     /* actions */
-    /* adversarial review card */
-    if (g.review) {
-      const rev = el('div', 'reqform reviewbox');
-      const running = g.review.running;
-      rev.append(el('h2', '', running
-        ? `🛡️ Adversarial review — round ${g.review.round} of ${REVIEW_MAX_ROUNDS} (Opus 4.8, max effort)…`
-        : g.review.error
-          ? '🛡️ Adversarial review — stopped on an error'
-          : g.review.finalClean
-            ? `🛡️ Adversarial review — CLEAN after ${g.review.rounds.length} round${g.review.rounds.length === 1 ? '' : 's'}`
-            : `🛡️ Adversarial review — ${g.review.rounds.length} rounds completed`));
-      if (g.review.error) rev.append(el('div', 'reqhint', g.review.error));
-      for (const rd of g.review.rounds) {
-        const rbox = el('div', 'reviewround' + (rd.clean ? ' clean' : ''));
-        rbox.append(el('b', '', `Round ${rd.round}: ${rd.clean ? '✓ no flags — schedule holds up' : `${rd.flags.length} flag${rd.flags.length === 1 ? '' : 's'}, ${rd.fixesApplied} fix${rd.fixesApplied === 1 ? '' : 'es'} applied${rd.rejected ? ` · ${rd.rejected} rejected (would cut someone below their average)` : ''}`}`));
-        if (rd.summary) rbox.append(el('div', 'reqhint', rd.summary));
-        for (const f of rd.flags) {
-          const li = el('div', 'reviewflag sev-' + f.severity);
-          li.append(el('span', 'req-badge ' + (f.severity === 'high' ? 'req-denied' : f.severity === 'medium' ? 'req-pending' : 'req-approved'), f.severity));
-          li.append(document.createTextNode(' ' + f.issue));
-          rbox.append(li);
-        }
-        rev.append(rbox);
-      }
-      if (running) rev.append(el('div', 'reqhint', 'Each round Opus tries to break the schedule; fixes are applied and it reviews again until it finds nothing or four rounds pass.'));
-      wrap.append(rev);
-    }
-
     const act = el('div', 'reqform');
     const arow = el('div', 'reqrow');
     if (!g.applied) {
       const apply = el('button', 'primary genbtn', `Apply ${res.assignments.length} assignments as drafts`);
       apply.onclick = () => { applyGeneration(res); g.applied = true; render(); };
       arow.append(apply);
-      if (backendOn() && !(g.review && g.review.running)) {
-        const revBtn = el('button', '', g.review ? '🛡️ Re-run adversarial review' : '🛡️ Adversarial review ×4 (Opus max)');
-        revBtn.title = 'Opus 4.8 at max effort tries to break this schedule; fixes apply automatically and it re-reviews until clean or 4 rounds';
-        revBtn.onclick = () => { runAdversarialReview(); };
-        arow.append(revBtn);
-      }
     } else {
       arow.append(el('span', 'okhint', `✓ Applied as drafts — publish from the Builder when ready`));
       const open = el('button', 'primary', 'Open Builder');
