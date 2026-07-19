@@ -397,6 +397,7 @@ table.flat th.sorted { color: var(--rh-yellow); }
 }
 .adjx { border: 0; background: none; color: #ffd98a; padding: 0 3px; font-size: 11px; cursor: pointer; }
 .adjx:hover { color: #fff; }
+.adjchip.hrdefault { border-color: var(--line); background: var(--panel); color: var(--ink-soft); }
 .src-assistant { background: color-mix(in srgb, var(--rh-yellow) 18%, var(--panel)); color: #ffd98a; border: 1px solid var(--rh-yellow); }
 .src-edited { background: color-mix(in srgb, var(--rh-blue) 22%, var(--panel)); color: #7ec8ec; border: 1px solid var(--rh-blue); }
 

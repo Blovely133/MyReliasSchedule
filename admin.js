@@ -117,6 +117,7 @@ function readOverlayFromStorage() {
   if (!overlay.genAdjust) overlay.genAdjust = [];
   if (!overlay.genChat) overlay.genChat = [];
   if (!overlay.tiers) overlay.tiers = {};
+  if (!overlay.houseRules) overlay.houseRules = {};
 }
 
 async function loadData(pin) {
@@ -317,7 +318,30 @@ function absMin(iso, hhmm) {
   return Date.UTC(y, m - 1, d, h, mm) / 60000;
 }
 function shiftEndMin(s) { return absMin(isOvernight(s) ? addDays(s.date, 1) : s.date, s.end); }
-const MIN_REST_MIN = 10 * 60;   // ≥10h between a shift's end and the next start — blocks mid→early-day and night→day
+
+/* house rules — the constants both placement engines enforce. HOUSE_DEFAULTS
+   are the shipped values; overlay.houseRules holds overrides (set by the
+   copilot's set_house_rules tool or cleared from the Rules dialog), so the
+   scheduler can say "8 hours rest is fine here" and the optimizer obeys.
+   One-shift-per-day and requested days off are NOT here — never tunable. */
+const HOUSE_DEFAULTS = {
+  restHours: 10,        // hard: hours off between a shift's end and the next start — blocks mid→early-day and night→day
+  maxRun: 5,            // hard: max consecutive days (per-provider mined block rules and chat max-run rules override)
+  capSlack: 1,          // hard: monthly cap = target + capSlack (an explicit request cap outranks)
+  floorSlack: 1,        // floor = target − floorSlack; nobody ends the month below it if avoidable
+  prnExemptFloor: true, // PRN/as-needed providers carry no floor
+  todHardMin: 8,        // shifts of history before the never-works-this-time-of-day lock applies (raise to loosen)
+  todHardFrac: 0.05,    // ≤ this share of history at a time of day = hard skip
+  wFill: 1000,          // optimizer reward for filling any slot — dominates every soft term
+  wPrefer: 100,         // granted preferred day
+  wBlock: 45,           // back-to-back worked days (scaled by mined block style)
+  wUnderFloor: 450,     // penalty per day a provider ends below floor
+  wOverTarget: 40,      // penalty per day over target (steady-N mined providers pay double)
+  wTod: 60,             // time-of-day affinity scale
+  wTierFt: 40, wTierPt: 20, wTierPrn: 0,   // hierarchy bonus: full-time > part-time > PRN
+};
+function houseRules() { return { ...HOUSE_DEFAULTS, ...(overlay.houseRules || {}) }; }
+function tierBonusOf(hr) { return { ft: hr.wTierFt, pt: hr.wTierPt, prn: hr.wTierPrn }; }
 function isWeekendDate(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   const day = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
@@ -1536,7 +1560,6 @@ function poolFor(site, mo) {
    the higher tier wins the shift. Set manually (provider table / chat) and
    stored globally; unset providers default to full-time, floats to PRN. */
 const TIER_LABEL = { ft: 'Full-time', pt: 'Part-time', prn: 'PRN' };
-const TIER_BONUS = { ft: 40, pt: 20, prn: 0 };
 function tierOf(who, isFloat) {
   const t = (overlay.tiers || {})[who];
   return t === 'ft' || t === 'pt' || t === 'prn' ? t : (isFloat ? 'prn' : 'ft');
@@ -1603,7 +1626,10 @@ function runGeneration(site, mo) {
   const pool = poolFor(site, mo);
   const reqs = requestsFor(site, mo);
   const profiles = timeProfiles();
-  const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  const hr = houseRules();
+  const tierBonus = tierBonusOf(hr);
+  const restMin = hr.restHours * 60;
+  const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || hr.maxRun;
   const minedMap = compileMinedRules();
   const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
   for (const s of all) {
@@ -1629,33 +1655,33 @@ function runGeneration(site, mo) {
       const r = reqs.get(p.who);
       const mined = minedMap.get(p.who);
       if (r && r.off.has(slot.date)) continue;                                   // hard: unavailable
-      let cap = (r && r.cap) || p.target + 1;                                    // hard: never more than 1 over their average/target
+      let cap = (r && r.cap) || p.target + hr.capSlack;                          // hard: never more than capSlack over their average/target
       if (mined && mined.loadN != null && mined.loadHard && !(r && r.cap)) cap = Math.max(0, mined.loadN - st.preDates);  // mined: exactly-N months pin the cap
       if (st.assigned >= cap) { if (r && r.cap) capsHit.add(p.who); continue; }
       if (st.dates.has(slot.date)) continue;                                     // hard: one shift/day
-      const prevShift = st.shiftByDate.get(addDays(slot.date, -1));              // hard: ≥10h rest between shifts
-      if (prevShift && absMin(slot.date, slot.start) - shiftEndMin(prevShift) < MIN_REST_MIN) continue;
+      const prevShift = st.shiftByDate.get(addDays(slot.date, -1));              // hard: minimum rest between shifts
+      if (prevShift && absMin(slot.date, slot.start) - shiftEndMin(prevShift) < restMin) continue;
       const pMax = (mined && mined.blockMax) || maxRun;                          // mined block rule overrides the global max-run
       let run = 0;
       for (let k = 1; k <= pMax; k++) { if (st.dates.has(addDays(slot.date, -k))) run++; else break; }
       if (run >= pMax) continue;                                                 // hard: max consecutive days (assistant-tunable, default 5)
       const bucket = shiftBucket(slot);
       if (st.tod) { if (bucket !== st.tod) continue; }                           // hard: assistant rule ("nights only")
-      else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
+      else if (st.prof && st.prof.total >= hr.todHardMin && st.prof[bucket] / st.prof.total <= hr.todHardFrac) continue;  // hard: never works this time of day
       if (mined && minedBlocks(mined, slot, slotDow)) continue;                  // hard: mined-from-history rules
       let score = 0;
       if (mined) score += minedScore(mined, slot, slotDow);                      // soft: mined-from-history rules
-      if (!st.tod && st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);  // time-of-day affinity
-      /* floor rule: nobody ends the month below their average minus one — a
-         provider still under floor outbids every other consideration.
-         PRN is exempt: "as needed" carries no guaranteed load.
-         Exactly-N providers' floor IS their N. */
-      let floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
+      if (!st.tod && st.prof && st.prof.total >= 4) score += Math.round((st.prof[bucket] / st.prof.total - 0.33) * hr.wTod);  // time-of-day affinity
+      /* floor rule: nobody ends the month below their average minus floorSlack —
+         a provider still under floor outbids every other consideration.
+         PRN is exempt (unless the rule is off): "as needed" carries no
+         guaranteed load. Exactly-N providers' floor IS their N. */
+      let floor = (hr.prnExemptFloor && tierOf(p.who, p.float) === 'prn') ? 0 : Math.max(0, Math.min(p.target - hr.floorSlack, (r && r.cap) || Infinity));
       if (st.minedLoadFloor != null && !(r && r.cap)) floor = st.minedLoadFloor;
-      if (st.dates.size < floor) score += 400 + (floor - st.dates.size) * 10;
-      if (r && r.prefer.has(slot.date)) score += 100;                            // honor preferences
-      if (st.dates.has(addDays(slot.date, -1))) score += Math.round(45 * (mined ? mined.blockMult : 1));  // build blocks (mined style scales it)
-      score += TIER_BONUS[tierOf(p.who, p.float)];                               // hierarchy: full-time > part-time > PRN
+      if (st.dates.size < floor) score += hr.wUnderFloor + (floor - st.dates.size) * 10;
+      if (r && r.prefer.has(slot.date)) score += hr.wPrefer;                     // honor preferences
+      if (st.dates.has(addDays(slot.date, -1))) score += Math.round(hr.wBlock * (mined ? mined.blockMult : 1));  // build blocks (mined style scales it)
+      score += tierBonus[tierOf(p.who, p.float)];                                // hierarchy: full-time > part-time > PRN
       score -= (st.assigned / Math.max(1, p.target)) * 70;                       // balance load
       if (score > bestScore) { best = p; bestScore = score; }
     }
@@ -1674,6 +1700,7 @@ function runGeneration(site, mo) {
 
 /* shared tail for both engines: per-provider run/floor stats + summary counts */
 function finishGenResult({ site, mo, slots, skipped, assignments, unfilled, stats, reqs, capsHit, maxRun, engine, solver }) {
+  const hr = houseRules();
   for (const st of stats.values()) {
     let bestRun = 0;
     for (const d of st.dates) {
@@ -1684,7 +1711,7 @@ function finishGenResult({ site, mo, slots, skipped, assignments, unfilled, stat
     }
     st.longestRun = bestRun;
     const r = reqs.get(st.who);
-    st.floor = tierOf(st.who, st.float) === 'prn' ? 0 : Math.max(0, Math.min(st.target - 1, (r && r.cap) || Infinity));
+    st.floor = (hr.prnExemptFloor && tierOf(st.who, st.float) === 'prn') ? 0 : Math.max(0, Math.min(st.target - hr.floorSlack, (r && r.cap) || Infinity));
     if (st.minedLoadFloor != null && !(r && r.cap)) st.floor = st.minedLoadFloor;
     st.underFloor = st.dates.size < st.floor;
   }
@@ -1741,7 +1768,10 @@ async function runGenerationSolver(site, mo, opts = {}) {
   const pool = opts.pool || poolFor(site, mo);
   const reqs = opts.reqs || requestsFor(site, mo);
   const profiles = opts.profiles || timeProfiles();
-  const maxRun = opts.maxRun || (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  const hr = houseRules();
+  const tierBonus = tierBonusOf(hr);
+  const restMin = hr.restHours * 60;
+  const maxRun = opts.maxRun || (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || hr.maxRun;
   const minedMap = opts.minedMap || compileMinedRules();
   const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
   for (const s of (opts.monthShifts || all)) {
@@ -1770,10 +1800,10 @@ async function runGenerationSolver(site, mo, opts = {}) {
   pool.forEach((p, pi) => {
     const st = stats.get(p.who);
     const r = reqs.get(p.who) || null;
-    let cap = (r && r.cap) || p.target + 1;
+    let cap = (r && r.cap) || p.target + hr.capSlack;
     if (opts.capAdjust && opts.capAdjust.has(p.who)) cap = Math.max(0, cap - opts.capAdjust.get(p.who));   // refill: kept shifts already spent it
-    let floor = tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity));
-    let overAt = p.target, overW = 40;
+    let floor = (hr.prnExemptFloor && tierOf(p.who, p.float) === 'prn') ? 0 : Math.max(0, Math.min(p.target - hr.floorSlack, (r && r.cap) || Infinity));
+    let overAt = p.target, overW = hr.wOverTarget;
     const m = minedMap.get(p.who);
     if (m && m.loadN != null && !(r && r.cap)) {   // an explicit request cap outranks the mined load rule
       if (m.loadHard) {
@@ -1783,7 +1813,7 @@ async function runGenerationSolver(site, mo, opts = {}) {
       } else {
         floor = Math.max(floor, m.loadN - 1);
         overAt = m.loadN;
-        overW = 80;   // steady-N providers: leaving N costs real points, but genuine variation can still win
+        overW = hr.wOverTarget * 2;   // steady-N providers: leaving N costs double, but genuine variation can still win
       }
     }
     byProv.set(p.who, { p, pi, st, r, cap, floor, overAt, overW, byDay: new Map(), names: [] });
@@ -1799,17 +1829,17 @@ async function runGenerationSolver(site, mo, opts = {}) {
       if (r && r.off.has(slot.date)) continue;                                 // hard: unavailable
       if (opts.excluded && opts.excluded.has(p.who + '|' + slotKey(slot))) continue;   // hard: removed from this exact slot
       if (st.dates.has(slot.date)) continue;                                   // hard: already working that day (any site)
-      const prev = st.shiftByDate.get(addDays(slot.date, -1));                 // hard: ≥10h rest vs pre-existing shifts, both directions
-      if (prev && absMin(slot.date, slot.start) - shiftEndMin(prev) < MIN_REST_MIN) continue;
+      const prev = st.shiftByDate.get(addDays(slot.date, -1));                 // hard: minimum rest vs pre-existing shifts, both directions
+      if (prev && absMin(slot.date, slot.start) - shiftEndMin(prev) < restMin) continue;
       const next = st.shiftByDate.get(addDays(slot.date, 1));
-      if (next && absMin(next.date, next.start) - shiftEndMin(slot) < MIN_REST_MIN) continue;
+      if (next && absMin(next.date, next.start) - shiftEndMin(slot) < restMin) continue;
       if (st.tod) { if (bucket !== st.tod) continue; }                         // hard: "nights only" rule
-      else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
+      else if (st.prof && st.prof.total >= hr.todHardMin && st.prof[bucket] / st.prof.total <= hr.todHardFrac) continue;  // hard: never works this time of day
       const mined = minedMap.get(p.who);
       if (mined && minedBlocks(mined, slot, dow)) continue;                    // hard: mined-from-history rules
-      let reward = 1000 + TIER_BONUS[tierOf(p.who, p.float)];                  // fill first, tier breaks ties
-      if (!st.tod && st.prof && st.prof.total >= 4) reward += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);
-      if (r && r.prefer.has(slot.date)) reward += 100;
+      let reward = hr.wFill + tierBonus[tierOf(p.who, p.float)];               // fill first, tier breaks ties
+      if (!st.tod && st.prof && st.prof.total >= 4) reward += Math.round((st.prof[bucket] / st.prof.total - 0.33) * hr.wTod);
+      if (r && r.prefer.has(slot.date)) reward += hr.wPrefer;
       if (mined) reward += minedScore(mined, slot, dow);                       // soft: mined-from-history rules
       const name = `x${pi}_${si}`;
       cols.push({ name, who: p.who, si, slot, reward });
@@ -1859,7 +1889,7 @@ async function runGenerationSolver(site, mo, opts = {}) {
       const nextItems = pr.byDay.get(day + 1);
       if (!nextItems) continue;
       for (const b of nextItems) {
-        const conflicts = items.filter(a => absMin(b.slot.date, b.slot.start) - shiftEndMin(a.slot) < MIN_REST_MIN);
+        const conflicts = items.filter(a => absMin(b.slot.date, b.slot.start) - shiftEndMin(a.slot) < restMin);
         if (conflicts.length) addCon(`${conflicts.map(c => c.name).join(' + ')} + ${b.name} <= 1`);
       }
     }
@@ -1902,12 +1932,12 @@ async function runGenerationSolver(site, mo, opts = {}) {
 
     const wNames = [...wByDay.values()];
 
-    /* floor: nobody below their average − 1 (soft, but priced above everything
-       except leaving a slot empty — same dominance the greedy +400 bonus had) */
+    /* floor: nobody below their average − floorSlack (soft, but priced above
+       everything except leaving a slot empty at the default weights) */
     const need = pr.floor - st.dates.size;
     if (need > 0 && wNames.length) {
       addCon(`${wNames.join(' + ')} + u${pi} >= ${need}`);
-      obj.push(`- 450 u${pi}`);
+      obj.push(`- ${hr.wUnderFloor} u${pi}`);
     }
 
     /* soft load-balance: days beyond target cost a little, so extras spread out
@@ -1918,10 +1948,10 @@ async function runGenerationSolver(site, mo, opts = {}) {
       obj.push(`- ${pr.overW} o${pi}`);
     }
 
-    /* block scheduling: reward back-to-back worked days (greedy's +45),
-       scaled by the provider's mined block style (7-on folks get double,
-       scattered-singles folks nearly none) */
-    const blockW = Math.round(45 * (mm ? mm.blockMult : 1));
+    /* block scheduling: reward back-to-back worked days (wBlock), scaled by
+       the provider's mined block style (7-on folks get double, scattered-
+       singles folks nearly none) */
+    const blockW = Math.round(hr.wBlock * (mm ? mm.blockMult : 1));
     if (blockW > 0) {
       for (const [day, w] of wByDay) {
         const left = wByDay.get(day - 1) || (preDay.has(day - 1) ? true : null);
@@ -2803,6 +2833,16 @@ const AGENT_TOOLS = [
     input_schema: { type: 'object', required: ['who'], properties: { who: { type: 'string' } } } },
   { name: 'refill_open_slots', description: 'Partial regeneration: the optimizer fills ONLY the proposal\'s currently OPEN slots while every existing assignment stays locked (rest/run/load rules hold across the combination). Use after clearing a provider or opening shifts.',
     input_schema: { type: 'object', properties: {} } },
+  { name: 'get_house_rules', description: 'Read the optimizer\'s built-in house rules: current value, default, and which are overridden. Covers rest hours, max consecutive days, cap/floor slack, PRN floor exemption, the time-of-day lock thresholds, and the soft-scoring weights (fill/preference/blocks/floor/over-target/time-of-day/tier).',
+    input_schema: { type: 'object', properties: {} } },
+  { name: 'set_house_rules', description: 'Change the house rules built into the optimizer, then rebuild the proposal. Pass only the fields to change. Numeric fields: restHours (min hours off between shifts, 0–24), maxRun (max consecutive days, 1–14; replaces any existing max-run chat rule), capSlack (cap = target+capSlack, 0–15), floorSlack (floor = target−floorSlack, 0–31), todHardMin (shifts of history before the time-of-day lock applies; raise to loosen, 0–9999), todHardFrac (lock threshold share, 0–1), and weights wFill/wPrefer/wBlock/wUnderFloor/wOverTarget/wTod/wTierFt/wTierPt/wTierPrn (0–5000; e.g. wBlock 0 stops rewarding back-to-back days). Boolean: prnExemptFloor. resetFields restores named fields to defaults; reset true restores everything. One-shift-per-day and requested days off are never tunable.',
+    input_schema: { type: 'object', properties: {
+      restHours: { type: 'number' }, maxRun: { type: 'number' }, capSlack: { type: 'number' }, floorSlack: { type: 'number' },
+      prnExemptFloor: { type: 'boolean' }, todHardMin: { type: 'number' }, todHardFrac: { type: 'number' },
+      wFill: { type: 'number' }, wPrefer: { type: 'number' }, wBlock: { type: 'number' }, wUnderFloor: { type: 'number' },
+      wOverTarget: { type: 'number' }, wTod: { type: 'number' }, wTierFt: { type: 'number' }, wTierPt: { type: 'number' }, wTierPrn: { type: 'number' },
+      resetFields: { type: 'array', items: { type: 'string' } }, reset: { type: 'boolean' },
+    } } },
   { name: 'get_drafts', description: 'List currently staged draft changes (edits/adds/removals) awaiting publish.',
     input_schema: { type: 'object', properties: {} } },
   { name: 'discard_drafts', description: 'Throw away ALL staged draft changes. Only when the user explicitly asks.',
@@ -2912,6 +2952,51 @@ async function agentToolExec(name, input) {
       await refillOpenSlots();
       return `Refill done: ${before - g.result.unfilled.length} of ${before} open slots filled by the optimizer (${g.result.engine === 'milp' ? g.result.solver.status : 'greedy'}); ${g.result.unfilled.length} remain open. Kept assignments untouched.`;
     }
+    if (name === 'get_house_rules') {
+      const cur = houseRules();
+      return Object.keys(HOUSE_DEFAULTS).map(k =>
+        `${k} = ${JSON.stringify(cur[k])}${cur[k] === HOUSE_DEFAULTS[k] ? '' : ` (default ${JSON.stringify(HOUSE_DEFAULTS[k])} — OVERRIDDEN)`}`
+      ).join('\n');
+    }
+    if (name === 'set_house_rules') {
+      const CLAMP = {
+        restHours: [0, 24], maxRun: [1, 14], capSlack: [0, 15], floorSlack: [0, 31],
+        todHardMin: [0, 9999], todHardFrac: [0, 1],
+        wFill: [0, 5000], wPrefer: [0, 5000], wBlock: [0, 5000], wUnderFloor: [0, 5000],
+        wOverTarget: [0, 5000], wTod: [0, 5000], wTierFt: [0, 5000], wTierPt: [0, 5000], wTierPrn: [0, 5000],
+      };
+      const INTS = new Set(['maxRun', 'capSlack', 'floorSlack', 'todHardMin']);
+      const before = houseRules();
+      const cur = { ...(overlay.houseRules || {}) };
+      const changed = [];
+      if (input.reset) {
+        for (const k of Object.keys(cur)) { changed.push(`${k} → default ${JSON.stringify(HOUSE_DEFAULTS[k])}`); delete cur[k]; }
+      }
+      for (const k of (input.resetFields || [])) {
+        if (k in cur) { changed.push(`${k} → default ${JSON.stringify(HOUSE_DEFAULTS[k])}`); delete cur[k]; }
+      }
+      for (const [k, [lo, hi]] of Object.entries(CLAMP)) {
+        if (typeof input[k] !== 'number' || Number.isNaN(input[k])) continue;
+        let v = Math.min(hi, Math.max(lo, input[k]));
+        if (INTS.has(k)) v = Math.round(v);
+        if (v === before[k]) continue;
+        changed.push(`${k} ${JSON.stringify(before[k])} → ${v}`);
+        if (v === HOUSE_DEFAULTS[k]) delete cur[k]; else cur[k] = v;
+      }
+      if (typeof input.prnExemptFloor === 'boolean' && input.prnExemptFloor !== before.prnExemptFloor) {
+        changed.push(`prnExemptFloor ${before.prnExemptFloor} → ${input.prnExemptFloor}`);
+        if (input.prnExemptFloor === HOUSE_DEFAULTS.prnExemptFloor) delete cur.prnExemptFloor; else cur.prnExemptFloor = input.prnExemptFloor;
+      }
+      if (!changed.length) return 'No house rules changed — values already current or fields unrecognized. Call get_house_rules to see the knobs.';
+      overlay.houseRules = cur;
+      /* a house maxRun only bites if no chat/dialog max-run rule shadows it */
+      if (typeof input.maxRun === 'number') overlay.genAdjust = overlay.genAdjust.filter(a => a.kind !== 'maxRun');
+      audit(`Copilot house rules: ${changed.join(', ')}`, 'ai');
+      saveOverlay();
+      g.result = await runGenerationBest(g.site, g.month);
+      g.applied = false;
+      return `House rules updated (${changed.join(', ')}). Proposal rebuilt by ${g.result.engine === 'milp' ? 'the HiGHS optimizer' : 'the greedy fallback engine'}: ${g.result.assignments.length}/${g.result.slots} filled${g.result.underFloor.length ? `, below floor: ${g.result.underFloor.map(n2 => n2.replace(/,.*$/, '')).join(', ')}` : ''}.`;
+    }
     if (name === 'get_drafts') {
       const d = overlay.adminDraft;
       const edits = Object.entries(d.edits).map(([id, f]) => `edit ${id}: ${JSON.stringify(f)}`);
@@ -2942,12 +3027,22 @@ async function agentToolExec(name, input) {
 
 let agentConvo = [];   // in-memory conversation (API format); resets each login/reload
 
+/* the house-rules paragraph carries LIVE values so the copilot quotes reality,
+   and tells it these are knobs it owns via set_house_rules */
+function houseRulesPromptLine() {
+  const cur = houseRules();
+  const overridden = Object.keys(overlay.houseRules || {});
+  return `House rules the optimizer enforces (current values): nobody ends a month below their average minus ${cur.floorSlack}${cur.prnExemptFloor ? ' (PRN exempt)' : ' (PRN included)'}; nobody above target+${cur.capSlack}; ≥${cur.restHours}h rest between shifts; one shift/day; max ${cur.maxRun} consecutive days; providers locked to their usual time of day; hierarchy full-time > part-time > PRN.` +
+    (overridden.length ? ` Overridden from defaults right now: ${overridden.map(k => `${k}=${JSON.stringify(cur[k])}`).join(', ')}.` : '') +
+    ` These rules are YOURS to tune: when the scheduler asks to relax or tighten one ("8 hours rest is enough", "allow two over target", "PRNs need a floor too", "stop rewarding blocks"), call set_house_rules — it revalidates and rebuilds the proposal. get_house_rules lists every knob including the soft-scoring weights. Only one-shift-per-day and requested days off are untouchable. Providers with no shifts at a facility in the last 3 months are left off its automatic pool (stale there) — proposal_ops addProvider or a manual shift edit overrides that deliberately.`;
+}
+
 function agentSystemPrompt() {
   const g = state.gen;
   return [
     `You are the scheduling copilot for Relias Healthcare's MyReliasSchedule console (currently viewing ${siteName(g.site)}, ${g.month}). The user is the scheduler; help with ANYTHING schedule-related: answer questions, analyze coverage/fairness, and make changes.`,
     `You have full control through your tools. Read before you write: check the schedule/roster with get_schedule/get_providers rather than assuming. Shift edits stage as DRAFTS the staff can't see; tell the user drafts are pending and that they (or you, if they say so) must publish. Only call publish_drafts or discard_drafts when the user explicitly asks.`,
-    `House rules you must respect and can explain: nobody ends a month below their average minus one (PRN exempt); nobody above target+1; ≥10h rest between shifts; one shift/day; max-consecutive-days rule; keep people on their usual time of day; hierarchy full-time > part-time > PRN. Providers with no shifts at a facility in the last 3 months are left off its automatic pool (stale there) — proposal_ops addProvider or a manual shift edit overrides that deliberately.`,
+    houseRulesPromptLine(),
     `Schedule placement is done by the HiGHS mixed-integer optimizer (a real MILP solver running in the browser), NOT by you and not by a greedy heuristic — run_generation/proposal_ops invoke it, and its result is provably optimal or near-optimal under the house rules. Never hand-place a whole month shift-by-shift; adjust the inputs (requests, caps, targets, tiers, rules) and re-run the optimizer. Individual swaps/edits via update_shift are fine. The tool result tells you which engine placed the proposal; "greedy fallback" appears only if the solver failed to load.`,
     `Site codes: ${Object.entries(SITE_NAMES).map(([c, n]) => `${c}=${n}`).join(', ')}.`,
     `Be concise and concrete — cite names, dates, and counts from tool results. If a request is ambiguous, ask.`,
@@ -2959,7 +3054,7 @@ async function runAgentChat(text) {
   agentConvo.push({ role: 'user', content: text });
   if (agentConvo.length > 40) agentConvo = agentConvo.slice(-30);
   let mutated = false;
-  const MUTATING = new Set(['update_shift', 'add_shift', 'remove_shift', 'set_tier', 'proposal_ops', 'run_generation', 'clear_provider_proposal', 'refill_open_slots', 'discard_drafts', 'publish_drafts']);
+  const MUTATING = new Set(['update_shift', 'add_shift', 'remove_shift', 'set_tier', 'proposal_ops', 'run_generation', 'clear_provider_proposal', 'refill_open_slots', 'set_house_rules', 'discard_drafts', 'publish_drafts']);
   for (let hop = 0; hop < 8; hop++) {
     const data = await backendCall('/api/agent', { system: agentSystemPrompt(), messages: agentConvo, tools: AGENT_TOOLS });
     agentConvo.push({ role: 'assistant', content: data.content });
@@ -3308,6 +3403,35 @@ function openRulesDialog() {
       }
       body.append(listBox);
 
+      /* house rules built into the optimizer — the copilot edits these
+         (set_house_rules); here they're visible, and overrides reset with ✕ */
+      const hrCur = houseRules();
+      const hrOver = overlay.houseRules || {};
+      const hrBox = el('div', 'rulegroup');
+      hrBox.append(el('h3', '', 'House rules (optimizer)'));
+      hrBox.append(el('div', 'reqhint', 'Baked-in rules both engines enforce. Ask the copilot to change them — e.g. “8 hours rest is enough” or “stop rewarding blocks”. ✕ resets an override to the default.'));
+      const hrChips = el('div', 'adjrow');
+      for (const k of Object.keys(HOUSE_DEFAULTS)) {
+        const isOver = k in hrOver;
+        const chip = el('span', 'adjchip' + (isOver ? '' : ' hrdefault'), `${k} ${JSON.stringify(hrCur[k])}`);
+        if (isOver) {
+          chip.title = `default ${JSON.stringify(HOUSE_DEFAULTS[k])}`;
+          const x = el('button', 'adjx', '✕');
+          x.type = 'button';
+          x.onclick = () => {
+            delete overlay.houseRules[k];
+            audit(`House rule ${k} reset to default (${JSON.stringify(HOUSE_DEFAULTS[k])})`, 'ai');
+            rebuildProposal(site, mo);
+            saveOverlay();
+            paint();
+          };
+          chip.append(x);
+        }
+        hrChips.append(chip);
+      }
+      hrBox.append(hrChips);
+      body.append(hrBox);
+
       const actions = el('div', 'dialog-actions');
       actions.append(el('span', 'spacer'));
       const done = el('button', 'primary', 'Done');
@@ -3374,6 +3498,7 @@ function addToSlot(res, slot, who) {
 
 /* who could legally take this open slot, given the current proposal state */
 function proposalCandidates(res, slot) {
+  const hr = houseRules();
   const need = slotRole(slot.pos);
   const bucket = shiftBucket(slot);
   const out = [];
@@ -3384,10 +3509,10 @@ function proposalCandidates(res, slot) {
     if (st.dates.has(slot.date)) continue;                                    // already works that day — never valid
     if (r && r.off.has(slot.date)) warn.push('marked off');
     const prev = st.shiftByDate?.get(addDays(slot.date, -1));
-    if (prev && absMin(slot.date, slot.start) - shiftEndMin(prev) < MIN_REST_MIN) warn.push('<10h rest');
+    if (prev && absMin(slot.date, slot.start) - shiftEndMin(prev) < hr.restHours * 60) warn.push(`<${hr.restHours}h rest`);
     if (st.tod && bucket !== st.tod) warn.push(`usually ${st.tod}s`);
-    else if (!st.tod && st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) warn.push('off-pattern time');
-    const cap = (r && r.cap) || st.target + 1;
+    else if (!st.tod && st.prof && st.prof.total >= hr.todHardMin && st.prof[bucket] / st.prof.total <= hr.todHardFrac) warn.push('off-pattern time');
+    const cap = (r && r.cap) || st.target + hr.capSlack;
     const over = st.assigned >= cap;
     out.push({ who: st.who, assigned: st.assigned, target: st.target, over, warn: warn.join(' · ') });
   }
@@ -3544,7 +3669,8 @@ async function stageGenerateClaude() {
     .filter(r => providers.some(p => p.who === r.who) || r.source === 'example')
     .map(r => ({ who: r.who, off: [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), prefer: [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), cap: r.cap, note: r.note }));
   const openSlots = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
-  const maxRun = (genAdjustFor(g.site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  const hrp = houseRules();
+  const maxRun = (genAdjustFor(g.site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || hrp.maxRun;
   /* Opus writes the narrative; the optimizer owns the placement AND the numbers.
      (/api/generate still returns targets for older clients, but they are no
      longer applied — asking a language model to pick twenty interacting
@@ -3552,7 +3678,7 @@ async function stageGenerateClaude() {
   const [plan, res] = await Promise.allSettled([
     backendCall('/api/generate', {
       site: g.site, siteName: siteName(g.site), month: g.month, historyMonths: HIST_MONTHS.length,
-      openSlots, providers, requests: reqs, rules: `no more than ${maxRun} consecutive days; at least 10h between shifts; keep night providers on nights`,
+      openSlots, providers, requests: reqs, rules: `no more than ${maxRun} consecutive days; at least ${hrp.restHours}h between shifts; keep night providers on nights`,
     }),
     runGenerationBest(g.site, g.month),
   ]);
@@ -3841,6 +3967,7 @@ function renderGenerate(main) {
     renderProposalCalendar(wrap, res);
 
     /* AI notes */
+    const hrn = houseRules();
     const notesBox = el('div', 'reqform');
     cardHeader(notesBox, 'AI notes on this proposal', '＋ Add rule', () => openRulesDialog());
     const ul = el('ul', 'ainotes');
@@ -3848,7 +3975,7 @@ function renderGenerate(main) {
     bullet(`Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
     const avgEx = [...res.stats.values()].filter(s => s.fromAvg && s.assigned).sort((a, b) => b.assigned - a.assigned)[0];
     bullet(`Each provider's target is their own average days worked per month, June–August${avgEx ? ` — e.g., ${avgEx.who.replace(/,.*$/, '')} averages ${avgEx.avg.toFixed(1)} days/month and is proposed for ${avgEx.assigned}` : ''}.`);
-    bullet('Hard fairness rail: nobody is scheduled more than one shift above their average/target — requests shape which days you work, not how many.');
+    bullet(`Hard fairness rail: nobody is scheduled more than ${hrn.capSlack === 1 ? 'one shift' : `${hrn.capSlack} shifts`} above their average/target — requests shape which days you work, not how many.`);
     const nightEx = [...res.stats.values()].find(s => {
       if (!s.assigned || !s.prof || s.prof.total < 8 || s.prof.night / s.prof.total < 0.9) return false;
       return res.assignments.filter(a => a.who === s.who).every(a => shiftBucket(a.slot) === 'night');
@@ -3861,11 +3988,13 @@ function renderGenerate(main) {
     if (res.preferTotal) bullet(`${res.preferGot} of ${res.preferTotal} preferred days granted; the misses lost out to load balancing or one-shift-per-day.`);
     if (res.capsHit.length) bullet(`Shift caps held: ${res.capsHit.map(n => n.replace(/,.*$/, '')).join(', ')} stopped at their requested maximums.`);
     bullet(res.underFloor.length
-      ? `⚠ Below their normal load (average − 1): ${res.underFloor.map(n => n.replace(/,.*$/, '')).join(', ')} — their days off, time-of-day pattern, or the open-shift mix left too few eligible shifts. Consider freeing shifts for them.`
-      : `Everyone gets at least their average minus one — nobody's month falls below their normal load.`);
+      ? `⚠ Below their normal load (average − ${hrn.floorSlack}): ${res.underFloor.map(n => n.replace(/,.*$/, '')).join(', ')} — their days off, time-of-day pattern, or the open-shift mix left too few eligible shifts. Consider freeing shifts for them.`
+      : `Everyone gets at least their average minus ${hrn.floorSlack === 1 ? 'one' : hrn.floorSlack} — nobody's month falls below their normal load.`);
     const runners = [...res.stats.values()].filter(s => s.longestRun >= 3).sort((a, b) => b.longestRun - a.longestRun).slice(0, 2);
     for (const r of runners) bullet(`Block scheduling: ${r.who.replace(/,.*$/, '')} works up to ${r.longestRun} consecutive days rather than scattered singles.`);
-    bullet(`At least 10 hours off between shifts — no mid-to-morning (e.g. 11:00–23:00 then a 06:00 start) and no night-to-day flips — and no stretches over ${res.maxRun} days, by rule.`);
+    bullet(`At least ${hrn.restHours} hours off between shifts${hrn.restHours >= 10 ? ' — no mid-to-morning (e.g. 11:00–23:00 then a 06:00 start) and no night-to-day flips —' : ''} and no stretches over ${res.maxRun} days, by rule.`);
+    const hrChanged = Object.keys(overlay.houseRules || {});
+    if (hrChanged.length) bullet(`⚙ House rules changed from defaults: ${hrChanged.map(k => `${k} ${JSON.stringify(hrn[k])}`).join(', ')} — set via copilot; reset from the Rules dialog.`);
     for (const r of [...res.reqs.values()].filter(r => r.note && !r.off.size && !r.prefer.size && !r.cap)) {
       bullet(`Noted but not auto-enforced: ${r.who.replace(/,.*$/, '')} — “${r.note}”.`);
     }
