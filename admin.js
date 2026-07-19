@@ -29,6 +29,7 @@ let state = {
   pos: '',
   search: '',
   focusDay: null,       // set by a coverage-cell click; highlighted in the Builder grid
+  selDay: null,         // phone month grid: tapped day showing its detail card
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
   gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null },
@@ -59,6 +60,11 @@ const el = (tag, cls, text) => {
   if (text !== undefined) n.textContent = text;
   return n;
 };
+
+/* phone layout: Builder + Generate month grids render compact w/ tap-a-day detail */
+const phoneMq = window.matchMedia('(max-width: 640px)');
+const isPhone = () => phoneMq.matches;
+phoneMq.addEventListener('change', () => { if (!document.body.classList.contains('access-locked')) render(); });
 
 /* ---------- notifications + audit ---------- */
 /* to === '' means the scheduler (this console's) inbox */
@@ -698,6 +704,76 @@ function renderApprovals(main) {
 
 /* ---------- coverage board ---------- */
 
+/* ---------- phone month calendar: whole month in one grid + tap-a-day detail ----------
+   Mirrors the employee app's phoneMonthCal. opts: cellMarks(iso, items) → small nodes
+   per day cell; detailChip(item) → full chip for the tapped day; expandSet, isOpen,
+   sort, searchable, collapse, onAdd. */
+function phoneMonthCal(main, mo, byDay, opts) {
+  const collapse = opts.collapse || 8;
+  const expandSet = opts.expandSet || state.expandedDays;
+  const isOpen = opts.isOpen || (s => !s.who);
+  if (state.selDay && !state.selDay.startsWith(mo)) state.selDay = null;
+  const sel = state.selDay || (TODAY.startsWith(mo) ? TODAY : null);
+
+  const [y, m] = mo.split('-').map(Number);
+  const table = el('table', 'bigcal phonecal');
+  const hr = el('tr');
+  for (const d of ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']) hr.append(el('th', '', d));
+  table.append(hr);
+  const first = new Date(Date.UTC(y, m - 1, 1));
+  const daysIn = new Date(y, m, 0).getDate();
+  let tr = el('tr');
+  for (let i = 0; i < first.getUTCDay(); i++) tr.append(el('td', 'off'));
+  for (let day = 1; day <= daysIn; day++) {
+    const iso = `${mo}-${String(day).padStart(2, '0')}`;
+    const td = el('td', (iso === TODAY ? 'today' : '') + (iso === sel ? ' sel' : '') + (iso === state.focusDay ? ' focusday' : ''));
+    td.append(el('div', 'dn', String(day)));
+    for (const node of opts.cellMarks(iso, byDay.get(iso) || [])) td.append(node);
+    td.onclick = () => { state.selDay = iso; render(); };
+    tr.append(td);
+    if ((first.getUTCDay() + day) % 7 === 0) { table.append(tr); tr = el('tr'); }
+  }
+  if (tr.children.length) { while (tr.children.length < 7) tr.append(el('td', 'off')); table.append(tr); }
+  main.append(table);
+
+  if (!sel) {
+    main.append(el('div', 'daydetail-hint', 'Tap a day to see and edit its shifts.'));
+    return;
+  }
+  const cell = (byDay.get(sel) || []).slice()
+    .sort(opts.sort || ((a, b) => a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos)));
+  const card = el('div', 'aday daydetail' + (sel === TODAY ? ' today' : ''));
+  const head = el('div', 'adayhead');
+  head.append(el('span', 'adayname', fmtDateLong(sel)));
+  if (sel === TODAY) head.append(el('span', 'todaytag', 'Today'));
+  const openCount = cell.filter(isOpen).length;
+  if (openCount) head.append(el('span', 'opendot', `${openCount} open`));
+  card.append(head);
+  // with a search active, surface matching shifts instead of the first N
+  const q = state.search.toLowerCase();
+  const ordered = q && opts.searchable !== false
+    ? [...cell].sort((a, b) => (matchesSearch(b, q) ? 1 : 0) - (matchesSearch(a, q) ? 1 : 0))
+    : cell;
+  const expanded = expandSet.has(sel);
+  const show = expanded ? ordered : ordered.slice(0, collapse);
+  for (const item of show) card.append(opts.detailChip(item));
+  if (ordered.length > collapse) {
+    const more = el('button', 'morebtn', expanded ? 'show less' : `+${ordered.length - collapse} more`);
+    more.onclick = () => {
+      if (expanded) expandSet.delete(sel); else expandSet.add(sel);
+      render();
+    };
+    card.append(more);
+  }
+  if (!cell.length) card.append(el('div', 'anone', 'No shifts'));
+  if (opts.onAdd) {
+    const add = el('button', 'addbtn agenda-add', '+ add shift');
+    add.onclick = () => opts.onAdd(sel);
+    card.append(add);
+  }
+  main.append(card);
+}
+
 function renderCoverage(main) {
   const days = monthDays(state.month);
   const inWindow = filtered(adminShifts()).filter(s => s.date.startsWith(state.month));
@@ -776,6 +852,7 @@ function renderCoverage(main) {
       b.onclick = () => {
         state.site = site === '—' ? '' : site;
         state.focusDay = d;
+        state.selDay = d;
         setView('builder');
         document.querySelector('.bigcal td.focusday')?.scrollIntoView({ block: 'center' });
       };
@@ -802,6 +879,7 @@ function builderChip(s) {
   b.append(el('span', 't', `${s.start}–${s.end}`));
   const meta = [s.site, role].filter(Boolean).join(' · ');
   b.append(el('span', 'who', (s.who ? s.who.replace(/,.*$/, '') : 'OPEN') + (meta ? ` · ${meta}` : '')));
+  if (isPhone()) b.append(el('span', 'site', s.pos));
   if (s.draft) b.append(el('span', 'draftflag', 'draft'));
   b.title = `${s.start}–${s.end} · ${s.pos} · ${s.who || 'OPEN'}${s.site ? ` · ${siteName(s.site)}` : ''}${s.note ? ` — ${s.note}` : ''}${s.draft ? ' · DRAFT (unpublished)' : ''}`;
   if (state.search && !matchesSearch(s, state.search.toLowerCase())) b.classList.add('dim');
@@ -878,6 +956,24 @@ function renderBuilder(main) {
     if (!byDay.has(s.date)) byDay.set(s.date, []);
     byDay.get(s.date).push(s);
   }
+
+  if (isPhone()) {
+    phoneMonthCal(main, mo, byDay, {
+      detailChip: builderChip,
+      onAdd: iso => openDialog(null, { date: iso, pos: state.pos || '', site: state.site || '' }),
+      cellMarks: (iso, cell) => {
+        const out = [];
+        if (cell.length) out.push(el('span', 'cellcount', cell.length.toLocaleString()));
+        const openCount = cell.filter(s => !s.who).length;
+        if (openCount) out.push(el('span', 'cellcount open', `${openCount} open`));
+        const draftsN = cell.filter(s => s.draft).length;
+        if (draftsN) out.push(el('span', 'cellcount draft', `${draftsN} draft`));
+        return out;
+      },
+    });
+    return;
+  }
+
   const [y, m] = mo.split('-').map(Number);
   const table = el('table', 'bigcal');
   const hr = el('tr');
@@ -2286,6 +2382,37 @@ async function stageGenerateClaude() {
 /* ---------- generate view ---------- */
 
 /* month-calendar preview of a generated proposal (assigned chips removable, OPEN chips fillable) */
+function proposalChip(res, it) {
+  const s = it.slot;
+  const b = el('button', 'chip mini2 proposal' + (it.who ? '' : ' open'));
+  b.type = 'button';
+  b.style.setProperty('--site', siteColor(s.site));
+  const need = slotRole(s.pos);
+  if (it.who && (need === 'PHY' || need === 'APC')) b.classList.add('role-' + need.toLowerCase());
+  b.append(el('span', 't', `${s.start}–${s.end}`));
+  const who = el('span', 'who', it.who ? it.who.replace(/,.*$/, '') : 'OPEN');
+  if (it.preferred) who.append(el('span', 'prefmark', ' ✓'));
+  b.append(who);
+  if (isPhone()) b.append(el('span', 'site', s.pos));
+  if (it.who) {
+    b.classList.add('editable');
+    b.title = `${s.start}–${s.end} · ${s.pos} · ${it.who}${it.preferred ? ' · preferred day granted' : ''}\nClick to remove — the shift opens back up.`;
+    b.onclick = () => {
+      if (!confirm(`Open up this shift?\n\n${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos}\n\nRemoves ${it.who}; the slot becomes OPEN.`)) return;
+      removeFromSlot(res, s);
+      recomputeProposalDerived(res);
+      state.gen.applied = false;
+      saveOverlay();
+      render();
+    };
+  } else {
+    b.classList.add('editable');
+    b.title = `Open ${s.pos} · ${s.start}–${s.end}\nClick to assign someone.`;
+    b.onclick = () => openSlotPicker(res, s);
+  }
+  return b;
+}
+
 function renderProposalCalendar(wrap, res) {
   const rf = state.gen.roleFilter;
   const box = el('div', 'reqform');
@@ -2319,6 +2446,25 @@ function renderProposalCalendar(wrap, res) {
   for (const a of res.assignments) if (keep(a.slot)) put({ slot: a.slot, who: a.who, preferred: a.preferred });
   for (const s of res.unfilled) if (keep(s)) put({ slot: s, who: '', preferred: false });
 
+  if (isPhone()) {
+    phoneMonthCal(box, res.mo, byDay, {
+      detailChip: it => proposalChip(res, it),
+      expandSet: state.gen.expanded,
+      searchable: false,
+      isOpen: it => !it.who,
+      sort: (a, b) => a.slot.start.localeCompare(b.slot.start) || a.slot.pos.localeCompare(b.slot.pos),
+      cellMarks: (iso, cell) => {
+        const out = [];
+        if (cell.length) out.push(el('span', 'cellcount', String(cell.length)));
+        const openCount = cell.filter(it => !it.who).length;
+        if (openCount) out.push(el('span', 'cellcount open', `${openCount} open`));
+        return out;
+      },
+    });
+    wrap.append(box);
+    return;
+  }
+
   const [y, m] = res.mo.split('-').map(Number);
   const table = el('table', 'bigcal');
   const hr = el('tr');
@@ -2340,35 +2486,7 @@ function renderProposalCalendar(wrap, res) {
     td.append(dn);
     const expanded = state.gen.expanded.has(iso);
     const show = expanded ? cell : cell.slice(0, COLLAPSED_CHIPS);
-    for (const it of show) {
-      const s = it.slot;
-      const b = el('button', 'chip mini2 proposal' + (it.who ? '' : ' open'));
-      b.type = 'button';
-      b.style.setProperty('--site', siteColor(s.site));
-      const need = slotRole(s.pos);
-      if (it.who && (need === 'PHY' || need === 'APC')) b.classList.add('role-' + need.toLowerCase());
-      b.append(el('span', 't', `${s.start}–${s.end}`));
-      const who = el('span', 'who', it.who ? it.who.replace(/,.*$/, '') : 'OPEN');
-      if (it.preferred) who.append(el('span', 'prefmark', ' ✓'));
-      b.append(who);
-      if (it.who) {
-        b.classList.add('editable');
-        b.title = `${s.start}–${s.end} · ${s.pos} · ${it.who}${it.preferred ? ' · preferred day granted' : ''}\nClick to remove — the shift opens back up.`;
-        b.onclick = () => {
-          if (!confirm(`Open up this shift?\n\n${fmtDateLong(s.date)} · ${s.start}–${s.end}\n${s.pos}\n\nRemoves ${it.who}; the slot becomes OPEN.`)) return;
-          removeFromSlot(res, s);
-          recomputeProposalDerived(res);
-          state.gen.applied = false;
-          saveOverlay();
-          render();
-        };
-      } else {
-        b.classList.add('editable');
-        b.title = `Open ${s.pos} · ${s.start}–${s.end}\nClick to assign someone.`;
-        b.onclick = () => openSlotPicker(res, s);
-      }
-      td.append(b);
-    }
+    for (const it of show) td.append(proposalChip(res, it));
     if (cell.length > COLLAPSED_CHIPS) {
       const more = el('button', 'morebtn', expanded ? 'show less' : `+${cell.length - COLLAPSED_CHIPS} more`);
       more.onclick = () => {
@@ -2855,7 +2973,7 @@ function setView(v) {
   state.view = v;
   document.querySelectorAll('#viewTabs button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
   const periodControls = v === 'coverage' || v === 'builder' || v === 'reports';
-  $('#filterBar').querySelector('.weeknav').style.visibility = periodControls ? 'visible' : 'hidden';
+  $('#filterBar').querySelector('.weeknav').style.display = periodControls ? '' : 'none';
   render();
 }
 

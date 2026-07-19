@@ -455,6 +455,42 @@ table.reqcal td.cell-off { background: color-mix(in srgb, #cf2e2e 24%, var(--pan
   .publishbar { position: static; flex-wrap: wrap; }
   .employee-link { display: none; }
 }
+
+/* ================= phone layout (extends styles.css phone rules) ================= */
+@media (max-width: 640px) {
+  /* bottom tab bar: 6 admin tabs, amber active, badges pinned to the corner */
+  .admin .tabs button { position: relative; font-size: 9.5px; padding: 5px 1px 4px; }
+  .admin .tabs button.active { background: rgb(255 176 41 / .16); color: #ffd98a; }
+  #viewTabs [data-view="approvals"]::before { content: '✅'; }
+  #viewTabs [data-view="coverage"]::before { content: '🧩'; }
+  #viewTabs [data-view="builder"]::before { content: '🛠️'; }
+  #viewTabs [data-view="reports"]::before { content: '📈'; }
+  #viewTabs [data-view="audit"]::before { content: '📜'; }
+  .tabbadge { position: absolute; top: 1px; right: 3px; margin-left: 0; }
+
+  /* keep the hop back to the employee app (hidden by the 900px rule) */
+  .employee-link { display: inline-block; font-size: 12px; padding: 8px 10px; }
+
+  .publishbar { margin: 0 10px 10px; padding: 10px 12px; gap: 8px; }
+  .publishbar #publishSummary { flex: 1 1 100%; }
+  .publishbar button { flex: 1; padding: 10px; }
+
+  .kpirow { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+  .kpi { padding: 10px 12px; }
+  .kpi .num { font-size: 22px; }
+
+  /* coverage matrix pans; slim the sticky site column so days show beside it */
+  table.cov th.sitecol { min-width: 118px; max-width: 130px; font-size: 11px; padding: 5px 6px; }
+  table.cov th.sitecol .sitesub { font-size: 9.5px; }
+  .covcell { min-height: 40px; }
+
+  .copytool .reqrow select { width: 100%; }
+  .cellcount.draft { color: var(--rh-yellow); }
+
+  .audititem { flex-wrap: wrap; }
+  .pickerlist { max-height: 46vh; }
+  .genchat .chatlog { max-height: 38vh; }
+}
 @media print {
   .publishbar, .employee-link { display: none !important; }
 }
