@@ -34,7 +34,7 @@ let state = {
   selDay: null,         // phone month grid: tapped day showing its detail card
   expandedDays: new Set(),
   repSort: { key: 'n', dir: -1 },
-  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null, backtest: null, analyzeOpen: false, analyzeWho: null },
+  gen: { site: 'TUP', month: '2026-09', result: null, running: false, applied: false, showEmails: false, expanded: new Set(), roleFilter: null, claudeTargets: null, claudeKey: null, claudePlan: null, backtest: null, analyzeOpen: false, analyzeWho: null, revise: false },
 };
 
 /* Site codes → full facility names, from WhenToWork's category list */
@@ -932,7 +932,7 @@ function renderBuilder(main) {
 
   /* copy-month tool */
   const tool = el('div', 'reqform copytool');
-  tool.append(el('h2', '', 'Copy a month forward'));
+  tool.append(el('h2', '', 'Month tools — copy forward · revise in the optimizer'));
   const row = el('div', 'reqrow');
   const months = monthList();
   /* target list also offers blank future months past the data range — that's
@@ -982,8 +982,25 @@ function renderBuilder(main) {
     render();
   };
   row.append(go);
+  /* Revise Schedule: open the month you're viewing in the optimizer, with the
+     current (published + draft) assignments loaded as the proposal */
+  const rev = el('button', 'primary', 'Revise Schedule');
+  rev.type = 'button';
+  rev.title = 'Open this month in the optimizer — current assignments loaded, requests on file, house rules live. Apply stages only what changes.';
+  rev.onclick = () => {
+    if (!state.site) { alert('Pick a facility first (site filter in the top bar) — the optimizer works one facility at a time.'); return; }
+    const g = state.gen;
+    g.site = state.site; g.month = state.month; g.revise = true;
+    g.applied = false; g.showEmails = false; g.expanded = new Set(); g.roleFilter = null;
+    g.claudeTargets = null; g.claudePlan = null; g.backtest = null;
+    g.result = loadPublishedProposal(g.site, g.month);
+    audit(`Revise: loaded the working ${fmtMonth(g.month)} schedule at ${siteName(g.site)} into the optimizer — ${g.result.assignments.length} assigned, ${g.result.unfilled.length} open`, 'ai');
+    saveOverlay();
+    setView('generate');
+  };
+  row.append(rev);
   tool.append(row);
-  tool.append(el('div', 'reqhint', 'Copies every shift (assignments included) with your current site/position filters applied, weekday-aligned, skipping duplicates. Review edge days in the calendar, then publish.'));
+  tool.append(el('div', 'reqhint', 'Copy duplicates every shift (assignments included) with your current site/position filters, weekday-aligned, skipping duplicates — review edge days, then publish. Revise Schedule instead re-opens the month you\'re viewing in the optimizer: current assignments become the proposal, requests stay loaded, and applying stages only the differences as drafts.'));
   main.append(tool);
 
   /* month grid */
@@ -1619,8 +1636,10 @@ function applyBackendOps(ops) {
 
 function runGeneration(site, mo) {
   const all = adminShifts();
-  const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && !s.who);
+  const revise = reviseActive(site, mo);   // revise: published assignments become movable slots
+  const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && (!s.who || revise));
   const slots = openHere.filter(s => slotRole(s.pos) !== 'SKIP')
+    .map(s => revise && s.who ? { ...s, pubWho: s.who, who: '' } : s)
     .sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
   const skipped = openHere.length - slots.length;
   const pool = poolFor(site, mo);
@@ -1632,8 +1651,10 @@ function runGeneration(site, mo) {
   const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || hr.maxRun;
   const minedMap = compileMinedRules();
   const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
+  const freed = revise ? new Set(slots.map(s => s.id)) : null;
   for (const s of all) {
     if (!s.who || !s.date.startsWith(mo)) continue;
+    if (freed && freed.has(s.id)) continue;   // revise: being re-placed, not a commitment
     const st = stats.get(s.who);
     if (st) { st.dates.add(s.date); st.shiftByDate.set(s.date, s); }
   }
@@ -1753,15 +1774,17 @@ async function runGenerationSolver(site, mo, opts = {}) {
   const t0 = performance.now();
   const highs = await loadHighs();
 
-  /* identical inputs to the greedy engine — or explicit overrides (backtest) */
+  /* identical inputs to the greedy engine — or explicit overrides (backtest/refill) */
   const all = adminShifts();
+  const revise = !opts.slots && !opts.monthShifts && reviseActive(site, mo);   // explicit overrides own their universe
   let slots, skipped;
   if (opts.slots) {
     slots = opts.slots.slice().sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
     skipped = 0;
   } else {
-    const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && !s.who);
+    const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && (!s.who || revise));
     slots = openHere.filter(s => slotRole(s.pos) !== 'SKIP')
+      .map(s => revise && s.who ? { ...s, pubWho: s.who, who: '' } : s)
       .sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
     skipped = openHere.length - slots.length;
   }
@@ -1774,8 +1797,10 @@ async function runGenerationSolver(site, mo, opts = {}) {
   const maxRun = opts.maxRun || (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || hr.maxRun;
   const minedMap = opts.minedMap || compileMinedRules();
   const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
+  const freed = revise ? new Set(slots.map(s => s.id)) : null;
   for (const s of (opts.monthShifts || all)) {
     if (!s.who || !s.date.startsWith(mo)) continue;
+    if (freed && freed.has(s.id)) continue;   // revise: being re-placed, not a commitment
     const st = stats.get(s.who);
     if (st) { st.dates.add(s.date); st.shiftByDate.set(s.date, s); }
   }
@@ -2058,10 +2083,14 @@ async function refillOpenSlots() {
     const keptByWho = new Map();
     for (const a of res.assignments) keptByWho.set(a.who, (keptByWho.get(a.who) || 0) + 1);
     const fixed = res.assignments.map(a => ({ ...a.slot, who: a.who }));
+    /* the proposal's slots ARE the truth for their shifts — drop their published
+       twins from the commitment list (matters in revise mode, where kept/cleared
+       slots still carry a `who` in the live schedule; no-op in open-slots mode) */
+    const proposalIds = new Set([...res.assignments.map(a => a.slot.id), ...res.unfilled.map(s => s.id)]);
     const partial = await runGenerationSolver(g.site, g.month, {
       slots: res.unfilled.slice(),
       pool: poolFor(g.site, g.month).filter(p => !(res.clearedWho && res.clearedWho.has(p.who))),   // benched providers sit out
-      monthShifts: [...adminShifts().filter(s => s.who && s.date.startsWith(g.month)), ...fixed],
+      monthShifts: [...adminShifts().filter(s => s.who && s.date.startsWith(g.month) && !proposalIds.has(s.id)), ...fixed],
       capAdjust: keptByWho,   // kept proposal shifts consume the cap — refill can't double-load anyone
       excluded: res.excluded, // removed-from-slot providers never get that slot back
     });
@@ -2088,6 +2117,74 @@ async function refillOpenSlots() {
   g.refilling = false;
   saveOverlay();
   render();
+}
+
+/* ---------- revise mode: rework a published month in the optimizer ----------
+   The Builder's "Revise Schedule" button loads the current working schedule
+   for a site+month into the Generate tab as the proposal itself. Each assigned
+   shift keeps `pubWho` (who holds it in the live schedule), so Apply stages
+   ONLY the delta — reassignments and unassignments — as drafts. While revise
+   mode is on, both engines treat the whole month as open slots (published
+   assignments become movable), so chat ops, house rules, and ✨ Generate
+   re-optimize the full month; clear-provider + refill stay surgical. */
+
+function reviseActive(site, mo) {
+  const g = state.gen;
+  return !!(g.revise && g.site === site && g.month === mo);
+}
+
+function loadPublishedProposal(site, mo) {
+  const all = adminShifts();
+  const here = all.filter(s => s.site === site && s.date.startsWith(mo));
+  const universe = here.filter(s => slotRole(s.pos) !== 'SKIP');
+  const skipped = here.length - universe.length;
+  const pool = poolFor(site, mo);
+  const reqs = requestsFor(site, mo);
+  const profiles = timeProfiles();
+  const hr = houseRules();
+  const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || hr.maxRun;
+  const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
+  const universeIds = new Set(universe.map(s => s.id));
+  for (const s of all) {   // commitments outside the universe still count (other sites, resident slots)
+    if (!s.who || !s.date.startsWith(mo) || universeIds.has(s.id)) continue;
+    const st = stats.get(s.who);
+    if (st) { st.dates.add(s.date); st.shiftByDate.set(s.date, s); }
+  }
+  for (const st of stats.values()) st.preDates = st.dates.size;
+  const slots = universe.map(s => s.who ? { ...s, pubWho: s.who, who: '' } : { ...s })
+    .sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
+  const assignments = [];
+  const unfilled = [];
+  for (const slot of slots) {
+    if (!slot.pubWho) { unfilled.push(slot); continue; }
+    const who = slot.pubWho;
+    let st = stats.get(who);
+    if (!st) {   // on the schedule but not in the auto pool — keep them visible, target 0
+      st = { who, role: providerRole(slot) || 'ANY', target: 0, avg: 0, fromAvg: false, float: false,
+        assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(who) || null, tod: null, preDates: 0 };
+      stats.set(who, st);
+    }
+    const r = reqs.get(who);
+    const preferred = !!(r && r.prefer.has(slot.date));
+    assignments.push({ slot, who, preferred });
+    st.assigned++;
+    if (preferred) st.preferGot++;
+    st.dates.add(slot.date);
+    st.shiftByDate.set(slot.date, slot);
+  }
+  return finishGenResult({ site, mo, slots, skipped, assignments, unfilled, stats, reqs, capsHit: new Set(), maxRun, engine: 'published' });
+}
+
+/* how many draft changes this proposal would stage vs the published schedule;
+   null when the proposal has no published context (normal open-slots mode) */
+function reviseDeltaCount(res) {
+  let any = false, n = 0;
+  for (const a of res.assignments) {
+    if (a.slot.pubWho !== undefined) { any = true; if (a.slot.pubWho !== a.who) n++; }
+    else n++;
+  }
+  for (const s of res.unfilled) if (s.pubWho) { any = true; n++; }
+  return any ? n : null;
 }
 
 /* ---------- Analyze: mine the real 6-month schedules into rules ----------
@@ -2536,8 +2633,10 @@ async function narrateAnalysis() {
 
 function applyGeneration(gen) {
   const d = overlay.adminDraft;
+  let changed = 0, unassigned = 0, kept = 0;
   for (const a of gen.assignments) {
     const s = a.slot;
+    if (s.pubWho !== undefined && s.pubWho === a.who) { kept++; continue; }   // revise: matches the live schedule — no draft
     if (s.forecast) {
       /* forecast slots are admin-side scaffolding — publish real added shifts instead */
       d.added.push({ id: nextAddId(), date: s.date, pos: s.pos, start: s.start, end: s.end, who: a.who, site: s.site, note: '' });
@@ -2545,9 +2644,15 @@ function applyGeneration(gen) {
     } else {
       d.edits[s.id] = { ...(d.edits[s.id] || {}), who: a.who };
     }
+    changed++;
+  }
+  for (const s of gen.unfilled) {
+    if (s.pubWho) { d.edits[s.id] = { ...(d.edits[s.id] || {}), who: '' }; unassigned++; }   // revise: holder removed — shift goes OPEN
   }
   saveOverlay();
-  audit(`AI draft: filled ${gen.assignments.length} of ${gen.slots} ${fmtMonth(gen.mo)} slots at ${siteName(gen.site)} from ${gen.reqs.size} provider requests (${gen.unfilled.length} left open)`, 'ai');
+  audit(kept || unassigned
+    ? `AI draft (revise): ${changed} reassignment${changed === 1 ? '' : 's'} + ${unassigned} unassignment${unassigned === 1 ? '' : 's'} vs the published ${fmtMonth(gen.mo)} schedule at ${siteName(gen.site)}; ${kept} shifts unchanged (no draft needed)`
+    : `AI draft: filled ${gen.assignments.length} of ${gen.slots} ${fmtMonth(gen.mo)} slots at ${siteName(gen.site)} from ${gen.reqs.size} provider requests (${gen.unfilled.length} left open)`, 'ai');
   render();
 }
 
@@ -2560,7 +2665,7 @@ async function stageGenerate() {
   render();
   const pool = poolFor(g.site, g.month);
   const reqs = requestsFor(g.site, g.month);
-  const openCount = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
+  const openCount = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && (!s.who || reviseActive(g.site, g.month)) && slotRole(s.pos) !== 'SKIP').length;
   const setStep = t => { const elx = document.getElementById('genStatus'); if (elx) elx.textContent = t; };
   const pause = ms => new Promise(r => setTimeout(r, ms));
   setStep(`Reading ${reqs.size} provider request${reqs.size === 1 ? '' : 's'}…`);
@@ -2924,8 +3029,8 @@ async function agentToolExec(name, input) {
       return n ? `Applied ${n} ops; proposal rebuilt by ${g.result.engine === 'milp' ? 'the HiGHS optimizer' : 'the greedy fallback engine'}: ${g.result.assignments.length}/${g.result.slots} filled.` : 'No ops matched — check names/fields.';
     }
     if (name === 'run_generation') {
-      if (input.site) g.site = input.site;
-      if (input.month) g.month = input.month;
+      if (input.site && input.site !== g.site) { g.site = input.site; g.revise = false; }   // revise is per site+month
+      if (input.month && input.month !== g.month) { g.month = input.month; g.revise = false; }
       g.result = await runGenerationBest(g.site, g.month);
       g.applied = false;
       const under = g.result.underFloor.map(n2 => n2.replace(/,.*$/, '')).join(', ');
@@ -3044,9 +3149,10 @@ function agentSystemPrompt() {
     `You have full control through your tools. Read before you write: check the schedule/roster with get_schedule/get_providers rather than assuming. Shift edits stage as DRAFTS the staff can't see; tell the user drafts are pending and that they (or you, if they say so) must publish. Only call publish_drafts or discard_drafts when the user explicitly asks.`,
     houseRulesPromptLine(),
     `Schedule placement is done by the HiGHS mixed-integer optimizer (a real MILP solver running in the browser), NOT by you and not by a greedy heuristic — run_generation/proposal_ops invoke it, and its result is provably optimal or near-optimal under the house rules. Never hand-place a whole month shift-by-shift; adjust the inputs (requests, caps, targets, tiers, rules) and re-run the optimizer. Individual swaps/edits via update_shift are fine. The tool result tells you which engine placed the proposal; "greedy fallback" appears only if the solver failed to load.`,
+    g.revise ? `REVISE MODE is ON for ${siteName(g.site)} ${g.month}: the current proposal was loaded from the LIVE PUBLISHED schedule (each slot remembers its published holder). run_generation and proposal_ops re-optimize the ENTIRE month — published assignments become movable — while clear_provider_proposal + refill_open_slots are the surgical option that leaves everyone else in place. When the scheduler applies, only the DIFFERENCES vs the published schedule stage as drafts, so describe your changes as "N reassignments / M unassignments", not as filling a month from scratch.` : '',
     `Site codes: ${Object.entries(SITE_NAMES).map(([c, n]) => `${c}=${n}`).join(', ')}.`,
     `Be concise and concrete — cite names, dates, and counts from tool results. If a request is ambiguous, ask.`,
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 }
 
 async function runAgentChat(text) {
@@ -3668,7 +3774,7 @@ async function stageGenerateClaude() {
   const reqs = [...requestsFor(g.site, g.month).values()]
     .filter(r => providers.some(p => p.who === r.who) || r.source === 'example')
     .map(r => ({ who: r.who, off: [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), prefer: [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), cap: r.cap, note: r.note }));
-  const openSlots = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
+  const openSlots = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && (!s.who || reviseActive(g.site, g.month)) && slotRole(s.pos) !== 'SKIP').length;
   const hrp = houseRules();
   const maxRun = (genAdjustFor(g.site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || hrp.maxRun;
   /* Opus writes the narrative; the optimizer owns the placement AND the numbers.
@@ -3827,6 +3933,7 @@ function renderProposalCalendar(wrap, res) {
 function renderGenerate(main) {
   const g = state.gen;
   const months = ['2026-09', '2026-10', '2026-11', '2026-12'];
+  if (g.revise && g.month && !months.includes(g.month)) months.unshift(g.month);   // revising a published month outside the planning window
   if (!months.includes(g.month)) g.month = months[0];
   $('#weekStats').textContent = `${siteName(g.site)} · ${fmtMonth(g.month)}${g.result ? ` · proposal: ${g.result.assignments.length} of ${g.result.slots} slots filled` : ''}`;
   const wrap = el('div', 'reqwrap');
@@ -3836,6 +3943,18 @@ function renderGenerate(main) {
   intro.append(el('div', 'reqhint',
     'Collect requests → reconcile → draft → publish. The reconciliation engine runs live in this browser — days off are never violated, caps and rest rules hold, blocks stay together, night people stay on nights (time-of-day is learned from each provider\'s history), and each provider is targeted at their own average days worked over the last three months. In production the same loop runs through Claude\'s API, including emailing providers to collect requests and sending everyone their schedule.'));
   wrap.append(intro);
+
+  if (g.revise) {
+    const rv = el('div', 'reqform revisebar');
+    const txt = el('div');
+    txt.innerHTML = `🔁 <b>Revising the published schedule</b> — ${siteName(g.site)}, ${fmtMonth(g.month)}. The proposal below started as the live schedule with all requests on file. Chat, rules, and ✨ Generate re-optimize the <i>whole</i> month; Refill and per-shift edits stay surgical. Apply stages only what differs from what's published.`;
+    const ex = el('button', '', '✕ Exit revise');
+    ex.type = 'button';
+    ex.title = 'Back to open-slots planning — drops the loaded proposal (drafts already applied are kept)';
+    ex.onclick = () => { g.revise = false; g.result = null; g.applied = false; render(); };
+    rv.append(txt, ex);
+    wrap.append(rv);
+  }
 
   renderScheduleChat(wrap);
 
@@ -3849,7 +3968,7 @@ function renderGenerate(main) {
     if (s === g.site) o.selected = true;
     siteSel.append(o);
   }
-  siteSel.onchange = () => { g.site = siteSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
+  siteSel.onchange = () => { g.site = siteSel.value; g.revise = false; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
   const moSel = document.createElement('select');
   for (const m of months) {
     const o = el('option', '', fmtMonth(m));
@@ -3857,7 +3976,7 @@ function renderGenerate(main) {
     if (m === g.month) o.selected = true;
     moSel.append(o);
   }
-  moSel.onchange = () => { g.month = moSel.value; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
+  moSel.onchange = () => { g.month = moSel.value; g.revise = false; g.result = null; g.applied = false; g.showEmails = false; g.claudeTargets = null; g.claudePlan = null; render(); };
   const lb = (t, i) => { const l = el('label', '', t + ' '); l.append(i); return l; };
   row.append(lb('Site (★ = example requests seeded)', siteSel), lb('Month', moSel));
   const goBtn = el('button', 'primary genbtn', g.running ? 'Generating…' : '✨ Generate Schedule');
@@ -3944,9 +4063,11 @@ function renderGenerate(main) {
     kpis.append(kpi(`${res.preferGot}/${res.preferTotal}`, 'Preferred days granted', ''));
     wrap.append(kpis);
 
-    wrap.append(el('div', 'reqhint enginebadge', res.engine === 'milp'
-      ? `⚙ Placed by the HiGHS optimizer — mixed-integer model with ${res.solver.vars.toLocaleString()} decision variables and ${res.solver.rows.toLocaleString()} constraints, solved in-browser in ${(res.solver.ms / 1000).toFixed(1)}s (${res.solver.status === 'Optimal' ? 'proven optimal' : res.solver.status}).`
-      : '⚙ Placed by the built-in greedy engine — instant preview; the HiGHS optimizer replaces it in the background when available.'));
+    wrap.append(el('div', 'reqhint enginebadge', res.engine === 'published'
+      ? `⚙ Loaded from the live schedule — ${res.assignments.length} assigned, ${res.unfilled.length} open, nothing re-placed yet. Make changes via chat/rules, ⟲ Refill the opens, or hit ✨ Generate to re-optimize the whole month.`
+      : res.engine === 'milp'
+        ? `⚙ Placed by the HiGHS optimizer — mixed-integer model with ${res.solver.vars.toLocaleString()} decision variables and ${res.solver.rows.toLocaleString()} constraints, solved in-browser in ${(res.solver.ms / 1000).toFixed(1)}s (${res.solver.status === 'Optimal' ? 'proven optimal' : res.solver.status}).`
+        : '⚙ Placed by the built-in greedy engine — instant preview; the HiGHS optimizer replaces it in the background when available.'));
 
     {
       const rr = el('div', 'refillrow');
@@ -3972,7 +4093,9 @@ function renderGenerate(main) {
     cardHeader(notesBox, 'AI notes on this proposal', '＋ Add rule', () => openRulesDialog());
     const ul = el('ul', 'ainotes');
     const bullet = t => ul.append(el('li', '', t));
-    bullet(`Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
+    bullet(res.engine === 'published'
+      ? `The live ${fmtMonth(res.mo)} schedule as published — ${res.assignments.length} of ${res.slots} slots assigned (${pct}%), ${res.unfilled.length} open. Everything below describes the schedule as it stands; revise it and the notes update.`
+      : `Filled ${res.assignments.length} of ${res.slots} open slots (${pct}%).${res.skipped ? ` ${res.skipped} resident/student slots were left to the residency program.` : ''}`);
     const avgEx = [...res.stats.values()].filter(s => s.fromAvg && s.assigned).sort((a, b) => b.assigned - a.assigned)[0];
     bullet(`Each provider's target is their own average days worked per month, June–August${avgEx ? ` — e.g., ${avgEx.who.replace(/,.*$/, '')} averages ${avgEx.avg.toFixed(1)} days/month and is proposed for ${avgEx.assigned}` : ''}.`);
     bullet(`Hard fairness rail: nobody is scheduled more than ${hrn.capSlack === 1 ? 'one shift' : `${hrn.capSlack} shifts`} above their average/target — requests shape which days you work, not how many.`);
@@ -4080,7 +4203,11 @@ function renderGenerate(main) {
     const act = el('div', 'reqform');
     const arow = el('div', 'reqrow');
     if (!g.applied) {
-      const apply = el('button', 'primary genbtn', `Apply ${res.assignments.length} assignments as drafts`);
+      const delta = reviseDeltaCount(res);
+      const apply = el('button', 'primary genbtn', delta === null
+        ? `Apply ${res.assignments.length} assignments as drafts`
+        : `Apply ${delta} change${delta === 1 ? '' : 's'} vs published as drafts`);
+      if (delta === 0) { apply.disabled = true; apply.title = 'The proposal matches the published schedule — nothing to stage.'; }
       apply.onclick = () => { applyGeneration(res); g.applied = true; render(); };
       arow.append(apply);
     } else {
