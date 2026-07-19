@@ -173,6 +173,17 @@ async function unlockData() {
   const input = $('#accessPin');
   const submit = $('#accessSubmit');
   const error = $('#accessError');
+  /* rhPORTAL lives on this same origin and stores the team PIN when its own
+     gate is unlocked, so opening the schedule from the portal skips the prompt */
+  try {
+    const shared = localStorage.getItem('mrs-shared-pin');
+    if (shared) {
+      await loadData(shared);
+      $('#accessGate').remove();
+      document.body.classList.remove('access-locked');
+      return;
+    }
+  } catch {}
   while (true) {
     const pin = await waitForPinAttempt();
     submit.disabled = true;
@@ -180,6 +191,7 @@ async function unlockData() {
     error.textContent = '';
     try {
       await loadData(pin);
+      try { localStorage.setItem('mrs-shared-pin', pin); } catch {}
       $('#accessGate').remove();
       document.body.classList.remove('access-locked');
       return;
