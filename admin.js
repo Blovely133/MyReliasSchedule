@@ -1214,8 +1214,21 @@ function renderAudit(main) {
    in-browser logic if it's not connected or a call fails. */
 
 const BACKEND_KEY = 'mrs-claude-backend';
-function backendCfg() { try { return JSON.parse(localStorage.getItem(BACKEND_KEY) || 'null'); } catch { return null; } }
-function backendSet(cfg) { if (cfg && cfg.url) localStorage.setItem(BACKEND_KEY, JSON.stringify(cfg)); else localStorage.removeItem(BACKEND_KEY); }
+/* always-on default: the deployed Worker (URL is not a secret — the API key is
+   a Worker secret). A user-saved config overrides it; an explicit Disconnect
+   turns it off for that browser. */
+const DEFAULT_BACKEND_URL = 'https://shiftboard-claude.meadow-family-a291a2ba.workers.dev';
+function backendCfg() {
+  let stored = null;
+  try { stored = JSON.parse(localStorage.getItem(BACKEND_KEY) || 'null'); } catch {}
+  if (stored && stored.url) return stored;          // user-saved config wins
+  if (stored && stored.disabled) return null;       // user explicitly disconnected
+  return { url: DEFAULT_BACKEND_URL, token: '', isDefault: true };
+}
+function backendSet(cfg) {
+  if (cfg && cfg.url) localStorage.setItem(BACKEND_KEY, JSON.stringify(cfg));
+  else localStorage.setItem(BACKEND_KEY, JSON.stringify({ disabled: true }));   // explicit disconnect
+}
 function backendOn() { return Boolean(backendCfg()?.url); }
 
 async function backendCall(path, payload) {
