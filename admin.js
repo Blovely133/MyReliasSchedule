@@ -1612,6 +1612,11 @@ function runGeneration(site, mo) {
     st.dates.add(slot.date);
     st.shiftByDate.set(slot.date, slot);
   }
+  return finishGenResult({ site, mo, slots, skipped, assignments, unfilled, stats, reqs, capsHit, maxRun, engine: 'greedy' });
+}
+
+/* shared tail for both engines: per-provider run/floor stats + summary counts */
+function finishGenResult({ site, mo, slots, skipped, assignments, unfilled, stats, reqs, capsHit, maxRun, engine, solver }) {
   for (const st of stats.values()) {
     let bestRun = 0;
     for (const d of st.dates) {
@@ -1629,7 +1634,244 @@ function runGeneration(site, mo) {
   const offDays = [...reqs.values()].reduce((a, r) => a + r.off.size, 0);
   const preferTotal = [...reqs.values()].reduce((a, r) => a + r.prefer.size, 0);
   const preferGot = [...stats.values()].reduce((a, s) => a + s.preferGot, 0);
-  return { site, mo, slots: slots.length, skipped, assignments, unfilled, stats, reqs, offDays, preferTotal, preferGot, capsHit: [...capsHit], maxRun, underFloor };
+  return { site, mo, slots: slots.length, skipped, assignments, unfilled, stats, reqs, offDays, preferTotal, preferGot, capsHit: [...capsHit], maxRun, underFloor, engine, solver: solver || null };
+}
+
+/* ---------- MILP placement engine (HiGHS, in-browser WebAssembly) ----------
+   The greedy engine above fills slot-by-slot in date order; this one hands the
+   whole month to a real mixed-integer optimizer (HiGHS via highs-js, the same
+   solver class commercial rostering tools use). Identical hard rules — role,
+   days off, one shift/day, ≥10h rest, max-run, time-of-day — but coverage,
+   floors, preferences, tier hierarchy, and block scheduling are traded off
+   globally instead of slot-at-a-time. The greedy engine remains the instant
+   preview and the fallback when the WASM solver can't load. */
+
+const SOLVER_TIME_LIMIT_S = 20;
+
+let highsLoad = null;
+function loadHighs() {
+  if (highsLoad) return highsLoad;
+  highsLoad = new Promise((resolve, reject) => {
+    const boot = () => Module({ locateFile: f => 'vendor/' + f }).then(resolve, reject);
+    if (typeof Module === 'function') { boot(); return; }
+    const tag = document.createElement('script');
+    tag.src = 'vendor/highs.js';
+    tag.onload = boot;
+    tag.onerror = () => reject(new Error('could not load vendor/highs.js'));
+    document.head.append(tag);
+  });
+  highsLoad.catch(() => { highsLoad = null; });   // a failed load stays retryable
+  return highsLoad;
+}
+
+async function runGenerationSolver(site, mo) {
+  const t0 = performance.now();
+  const highs = await loadHighs();
+
+  /* identical inputs to the greedy engine */
+  const all = adminShifts();
+  const openHere = all.filter(s => s.site === site && s.date.startsWith(mo) && !s.who);
+  const slots = openHere.filter(s => slotRole(s.pos) !== 'SKIP')
+    .sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.pos.localeCompare(b.pos));
+  const skipped = openHere.length - slots.length;
+  const pool = poolFor(site, mo);
+  const reqs = requestsFor(site, mo);
+  const profiles = timeProfiles();
+  const maxRun = (genAdjustFor(site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  const stats = new Map(pool.map(p => [p.who, { ...p, assigned: 0, preferGot: 0, dates: new Set(), shiftByDate: new Map(), prof: profiles.get(p.who) || null }]));
+  for (const s of all) {
+    if (!s.who || !s.date.startsWith(mo)) continue;
+    const st = stats.get(s.who);
+    if (st) { st.dates.add(s.date); st.shiftByDate.set(s.date, s); }
+  }
+  const daysIn = new Date(Number(mo.slice(0, 4)), Number(mo.slice(5, 7)), 0).getDate();
+
+  /* decision variables: x{provider}_{slot} for every legal pairing, with the
+     greedy engine's scoring terms as the per-assignment reward */
+  const cols = [];
+  const byProv = new Map();
+  pool.forEach((p, pi) => {
+    const st = stats.get(p.who);
+    const r = reqs.get(p.who) || null;
+    byProv.set(p.who, {
+      p, pi, st, r,
+      cap: (r && r.cap) || p.target + 1,
+      floor: tierOf(p.who, p.float) === 'prn' ? 0 : Math.max(0, Math.min(p.target - 1, (r && r.cap) || Infinity)),
+      byDay: new Map(), names: [],
+    });
+  });
+  slots.forEach((slot, si) => {
+    const need = slotRole(slot.pos);
+    const day = +slot.date.slice(8);
+    const bucket = shiftBucket(slot);
+    for (const pr of byProv.values()) {
+      const { p, pi, st, r } = pr;
+      if (need !== 'ANY' && p.role !== 'ANY' && p.role !== need) continue;
+      if (r && r.off.has(slot.date)) continue;                                 // hard: unavailable
+      if (st.dates.has(slot.date)) continue;                                   // hard: already working that day (any site)
+      const prev = st.shiftByDate.get(addDays(slot.date, -1));                 // hard: ≥10h rest vs pre-existing shifts, both directions
+      if (prev && absMin(slot.date, slot.start) - shiftEndMin(prev) < MIN_REST_MIN) continue;
+      const next = st.shiftByDate.get(addDays(slot.date, 1));
+      if (next && absMin(next.date, next.start) - shiftEndMin(slot) < MIN_REST_MIN) continue;
+      if (st.tod) { if (bucket !== st.tod) continue; }                         // hard: "nights only" rule
+      else if (st.prof && st.prof.total >= 8 && st.prof[bucket] / st.prof.total <= 0.05) continue;  // hard: never works this time of day
+      let reward = 1000 + TIER_BONUS[tierOf(p.who, p.float)];                  // fill first, tier breaks ties
+      if (!st.tod && st.prof && st.prof.total >= 4) reward += Math.round((st.prof[bucket] / st.prof.total - 0.33) * 60);
+      if (r && r.prefer.has(slot.date)) reward += 100;
+      const name = `x${pi}_${si}`;
+      cols.push({ name, who: p.who, si, slot, reward });
+      pr.names.push(name);
+      if (!pr.byDay.has(day)) pr.byDay.set(day, []);
+      pr.byDay.get(day).push({ name, slot });
+    }
+  });
+
+  if (!cols.length) {
+    return finishGenResult({ site, mo, slots, skipped, assignments: [], unfilled: slots.slice(), stats, reqs, capsHit: new Set(), maxRun, engine: 'milp', solver: { vars: 0, rows: 0, ms: performance.now() - t0, status: 'Empty' } });
+  }
+
+  const obj = cols.map(c => `${c.reward} ${c.name}`);
+  const cons = [];
+  const bins = cols.map(c => c.name);
+  let cn = 0;
+  const addCon = expr => { cons.push(` c${++cn}: ${expr}`); };
+
+  /* every slot gets at most one provider */
+  const bySlot = new Map();
+  for (const c of cols) {
+    if (!bySlot.has(c.si)) bySlot.set(c.si, []);
+    bySlot.get(c.si).push(c.name);
+  }
+  for (const names of bySlot.values()) addCon(`${names.join(' + ')} <= 1`);
+
+  for (const pr of byProv.values()) {
+    if (!pr.names.length) continue;
+    const { pi, st, r, p } = pr;
+
+    /* one shift per day, linked through a worked-day indicator w */
+    const wByDay = new Map();
+    for (const [day, items] of pr.byDay) {
+      const w = `w${pi}_${day}`;
+      addCon(`${items.map(i => i.name).join(' + ')} - ${w} = 0`);
+      bins.push(w);
+      wByDay.set(day, w);
+    }
+
+    /* never more than 1 over target (or the explicit request cap) */
+    addCon(`${pr.names.join(' + ')} <= ${pr.cap}`);
+
+    /* ≥10h rest between proposed shifts on adjacent days: since at most one
+       shift is worked per day, one row per next-day slot covers all conflicts */
+    for (const [day, items] of pr.byDay) {
+      const nextItems = pr.byDay.get(day + 1);
+      if (!nextItems) continue;
+      for (const b of nextItems) {
+        const conflicts = items.filter(a => absMin(b.slot.date, b.slot.start) - shiftEndMin(a.slot) < MIN_REST_MIN);
+        if (conflicts.length) addCon(`${conflicts.map(c => c.name).join(' + ')} + ${b.name} <= 1`);
+      }
+    }
+
+    /* max consecutive days, counting pre-existing shifts in the month */
+    const preDay = new Set([...st.dates].map(d => +d.slice(8)));
+    for (let i = 1; i + maxRun <= daysIn; i++) {
+      const terms = [];
+      let constC = 0;
+      for (let d = i; d <= i + maxRun; d++) {
+        if (wByDay.has(d)) terms.push(wByDay.get(d));
+        else if (preDay.has(d)) constC++;
+      }
+      if (terms.length && terms.length + constC > maxRun) addCon(`${terms.join(' + ')} <= ${Math.max(0, maxRun - constC)}`);
+    }
+
+    const wNames = [...wByDay.values()];
+
+    /* floor: nobody below their average − 1 (soft, but priced above everything
+       except leaving a slot empty — same dominance the greedy +400 bonus had) */
+    const need = pr.floor - st.dates.size;
+    if (need > 0 && wNames.length) {
+      addCon(`${wNames.join(' + ')} + u${pi} >= ${need}`);
+      obj.push(`- 450 u${pi}`);
+    }
+
+    /* soft load-balance: days beyond target cost a little, so extras spread out */
+    const room = p.target - st.dates.size;
+    if (wNames.length > room) {
+      addCon(`${wNames.join(' + ')} - o${pi} <= ${room}`);
+      obj.push(`- 40 o${pi}`);
+    }
+
+    /* block scheduling: reward back-to-back worked days (greedy's +45) */
+    for (const [day, w] of wByDay) {
+      const left = wByDay.get(day - 1) || (preDay.has(day - 1) ? true : null);
+      if (!left) continue;
+      const a = `a${pi}_${day}`;
+      addCon(`${a} - ${w} <= 0`);
+      if (left !== true) addCon(`${a} - ${left} <= 0`);
+      obj.push(`+ 45 ${a}`);
+    }
+  }
+
+  const lp = `Maximize\n obj: ${obj.join('\n   + ').replace(/\+ -/g, '- ')}\nSubject To\n${cons.join('\n')}\nBinary\n ${bins.join('\n ')}\nEnd\n`;
+
+  await new Promise(r => setTimeout(r, 30));   // let the status line paint before the sync solve
+  /* stop within 0.5% of provably optimal — the last fraction of a percent is
+     pure proof time, not schedule quality */
+  const sol = highs.solve(lp, { time_limit: SOLVER_TIME_LIMIT_S, mip_rel_gap: 0.005 });
+  const okStatus = ['Optimal', 'Time limit reached', 'Bound on objective reached', 'Target for objective reached'];
+  if (!okStatus.includes(sol.Status)) throw new Error(`HiGHS status: ${sol.Status}`);
+
+  /* decode the solution back into the proposal shape both UIs already consume */
+  const assignments = [];
+  const covered = new Set();
+  const capsHit = new Set();
+  for (const c of cols.sort((a, b) => a.si - b.si)) {
+    const v = sol.Columns[c.name];
+    if (!v || v.Primal < 0.5) continue;
+    const st = stats.get(c.who);
+    const r = reqs.get(c.who);
+    const preferred = !!(r && r.prefer.has(c.slot.date));
+    assignments.push({ slot: c.slot, who: c.who, preferred });
+    covered.add(c.si);
+    st.assigned++;
+    if (preferred) st.preferGot++;
+    st.dates.add(c.slot.date);
+    st.shiftByDate.set(c.slot.date, c.slot);
+  }
+  for (const pr of byProv.values()) {
+    if (pr.r && pr.r.cap && pr.st.assigned >= pr.r.cap) capsHit.add(pr.p.who);
+  }
+  const unfilled = slots.filter((s, si) => !covered.has(si));
+  return finishGenResult({
+    site, mo, slots, skipped, assignments, unfilled, stats, reqs, capsHit, maxRun,
+    engine: 'milp',
+    solver: { vars: bins.length, rows: cn, ms: performance.now() - t0, status: sol.Status },
+  });
+}
+
+/* solver first, greedy as the safety net */
+async function runGenerationBest(site, mo) {
+  try {
+    return await runGenerationSolver(site, mo);
+  } catch (err) {
+    audit(`Optimizer unavailable (${String(err.message || err)}) — used the greedy engine`, 'ai');
+    return runGeneration(site, mo);
+  }
+}
+
+/* for synchronous call sites (dialogs, chat parser, undo chips): show the
+   greedy result instantly, then swap in the optimized one when it lands —
+   unless the user moved on (different site/month, cleared, or already applied) */
+let rebuildSeq = 0;
+function rebuildProposal(site, mo) {
+  const g = state.gen;
+  g.result = runGeneration(site, mo);
+  g.applied = false;
+  const seq = ++rebuildSeq;
+  runGenerationSolver(site, mo).then(res => {
+    if (seq !== rebuildSeq || g.site !== site || g.month !== mo || !g.result || g.applied) return;
+    g.result = res;
+    render();
+  }).catch(() => {});   // greedy preview already on screen
 }
 
 function applyGeneration(gen) {
@@ -1649,29 +1891,26 @@ function applyGeneration(gen) {
   render();
 }
 
-function stageGenerate() {
+async function stageGenerate() {
   if (backendOn()) return stageGenerateClaude();
   const g = state.gen;
   g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
   g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null; g.review = null;
+  rebuildSeq++;   // invalidate any in-flight background rebuild
   render();
   const pool = poolFor(g.site, g.month);
   const reqs = requestsFor(g.site, g.month);
   const openCount = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
-  const steps = [
-    `Reading ${reqs.size} provider request${reqs.size === 1 ? '' : 's'}…`,
-    `Scoring ${openCount.toLocaleString()} open slots against ${pool.length} providers…`,
-    'Applying rest rules, shift caps, and block scheduling…',
-    'Balancing load and honoring preferences…',
-  ];
-  let i = 0;
-  const tick = () => {
-    const elx = document.getElementById('genStatus');
-    if (!elx) { g.running = false; return; }
-    if (i < steps.length) { elx.textContent = steps[i++]; setTimeout(tick, 700); }
-    else { g.result = runGeneration(g.site, g.month); g.running = false; render(); }
-  };
-  tick();
+  const setStep = t => { const elx = document.getElementById('genStatus'); if (elx) elx.textContent = t; };
+  const pause = ms => new Promise(r => setTimeout(r, ms));
+  setStep(`Reading ${reqs.size} provider request${reqs.size === 1 ? '' : 's'}…`);
+  await pause(500);
+  setStep(`Building the constraint model — ${openCount.toLocaleString()} open slots × ${pool.length} providers…`);
+  await pause(500);
+  setStep('Solving with HiGHS — mixed-integer optimizer, right here in the browser…');
+  g.result = await runGenerationBest(g.site, g.month);
+  g.running = false;
+  render();
 }
 
 /* ---------- provider email previews ---------- */
@@ -1899,13 +2138,192 @@ function handleCommand(raw) {
   }
 
   if (changed && g.result) {
-    g.result = runGeneration(g.site, g.month);
-    g.applied = false;
+    rebuildProposal(g.site, g.month);
     reply += ` Regenerated: ${g.result.assignments.length} of ${g.result.slots} slots filled.`;
   } else if (changed) {
     reply += ' It\'ll apply the next time you generate.';
   }
   return { reply, changed };
+}
+
+/* ---------- open-ended Opus copilot: tools over the whole site ----------
+   The chat is a real agent loop: Opus answers questions or calls these tools,
+   the browser executes them against the live data (base + overlay), and the
+   results go back for the next turn. Shift changes stage as drafts (invisible
+   to staff until Publish), so full control stays reversible. */
+
+const AGENT_TOOLS = [
+  { name: 'get_schedule', description: 'Read shifts from the working schedule (published + drafts). Filter by site code, month (YYYY-MM), provider name, or open-only. Returns compact rows with shift ids.',
+    input_schema: { type: 'object', properties: { site: { type: 'string' }, month: { type: 'string' }, who: { type: 'string' }, openOnly: { type: 'boolean' }, dateFrom: { type: 'string' }, dateTo: { type: 'string' } } } },
+  { name: 'get_providers', description: 'Roster for a site+month: role, employment tier, target, recent average, usual time of day, requests on file (off/prefer/cap), and current month assignment counts.',
+    input_schema: { type: 'object', properties: { site: { type: 'string' }, month: { type: 'string' } } } },
+  { name: 'update_shift', description: 'Stage a draft edit to an existing shift by id: reassign (who, empty string = make OPEN), change times, note, position, or site. Staff cannot see drafts until published.',
+    input_schema: { type: 'object', required: ['id'], properties: { id: { type: 'string' }, who: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, date: { type: 'string' }, pos: { type: 'string' }, site: { type: 'string' }, note: { type: 'string' } } } },
+  { name: 'add_shift', description: 'Stage a new draft shift.',
+    input_schema: { type: 'object', required: ['date', 'start', 'end', 'pos', 'site'], properties: { date: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, pos: { type: 'string' }, site: { type: 'string' }, who: { type: 'string' }, note: { type: 'string' } } } },
+  { name: 'remove_shift', description: 'Stage a draft removal of a shift by id.',
+    input_schema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
+  { name: 'set_tier', description: 'Set a provider\'s employment tier: ft (full-time), pt (part-time), prn (as needed). Hierarchy: ft > pt > prn for shift preference; prn has no guaranteed load.',
+    input_schema: { type: 'object', required: ['who', 'tier'], properties: { who: { type: 'string' }, tier: { type: 'string', enum: ['ft', 'pt', 'prn'] } } } },
+  { name: 'proposal_ops', description: 'Apply generation-pool operations (addProvider/removeProvider/addOff/addPrefer/setCap/setTarget/setTimeOfDay/maxRun/move) and rebuild the AI proposal. Same op shapes as before.',
+    input_schema: { type: 'object', required: ['ops'], properties: { ops: { type: 'array', items: { type: 'object' } } } } },
+  { name: 'run_generation', description: 'Rebuild the AI proposal for a site+month with the deterministic engine (honors all rules, requests, tiers). Returns fill stats and per-provider loads.',
+    input_schema: { type: 'object', properties: { site: { type: 'string' }, month: { type: 'string' } } } },
+  { name: 'get_drafts', description: 'List currently staged draft changes (edits/adds/removals) awaiting publish.',
+    input_schema: { type: 'object', properties: {} } },
+  { name: 'discard_drafts', description: 'Throw away ALL staged draft changes. Only when the user explicitly asks.',
+    input_schema: { type: 'object', properties: {} } },
+  { name: 'publish_drafts', description: 'Publish every staged draft to the live schedule and notify affected staff. ONLY call when the user explicitly says to publish.',
+    input_schema: { type: 'object', properties: {} } },
+  { name: 'get_audit', description: 'Recent audit-log entries (publishes, approvals, AI actions).',
+    input_schema: { type: 'object', properties: { limit: { type: 'integer' } } } },
+];
+
+function agentToolExec(name, input) {
+  const g = state.gen;
+  const fmtRow = s => `${s.id} | ${s.date} ${s.start}–${s.end} | ${s.pos} | ${s.site || '—'} | ${s.who || 'OPEN'}${s.draft ? ' | DRAFT' : ''}${s.note ? ` | note: ${s.note}` : ''}`;
+  try {
+    if (name === 'get_schedule') {
+      let list = adminShifts();
+      if (input.site) list = list.filter(s => s.site === input.site);
+      if (input.month) list = list.filter(s => s.date.startsWith(input.month));
+      if (input.who) list = list.filter(s => s.who && s.who.toLowerCase().includes(String(input.who).toLowerCase()));
+      if (input.openOnly) list = list.filter(s => !s.who);
+      if (input.dateFrom) list = list.filter(s => s.date >= input.dateFrom);
+      if (input.dateTo) list = list.filter(s => s.date <= input.dateTo);
+      list.sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start));
+      const total = list.length;
+      const opens = list.filter(s => !s.who).length;
+      return `${total} shifts (${opens} open)${total > 350 ? ' — showing first 350' : ''}:\n` + list.slice(0, 350).map(fmtRow).join('\n');
+    }
+    if (name === 'get_providers') {
+      const site = input.site || g.site;
+      const mo = input.month || g.month;
+      const reqs = requestsFor(site, mo);
+      const profiles = timeProfiles();
+      const counts = new Map();
+      for (const s of adminShifts()) if (s.who && s.date.startsWith(mo) && s.site === site) counts.set(s.who, (counts.get(s.who) || 0) + 1);
+      return poolFor(site, mo).map(p => {
+        const r = reqs.get(p.who);
+        const bits = [`${p.who} — ${p.role}; ${TIER_LABEL[tierOf(p.who, p.float)]}; target ${p.target}${p.avg ? ` (avg ${p.avg.toFixed(1)})` : ''}; ${mo} assigned ${counts.get(p.who) || 0}; usual ${p.tod || usualShift(profiles.get(p.who))}`];
+        if (r) {
+          if (r.off.size) bits.push(`off ${[...r.off].map(d => +d.slice(8)).join(',')}`);
+          if (r.prefer.size) bits.push(`prefers ${[...r.prefer].map(d => +d.slice(8)).join(',')}`);
+          if (r.cap) bits.push(`cap ${r.cap}`);
+        }
+        return bits.join('; ');
+      }).join('\n') || 'no providers found';
+    }
+    if (name === 'update_shift') {
+      const s = adminShifts().find(x => x.id === input.id);
+      if (!s) return `No shift with id ${input.id}.`;
+      const fields = {};
+      for (const k of ['who', 'start', 'end', 'date', 'pos', 'site', 'note']) if (input[k] !== undefined) fields[k] = input[k];
+      draftEdit(s, fields);
+      audit(`Copilot draft edit — ${describeShift({ ...s, ...fields })}${fields.who !== undefined ? ` (${s.who || 'OPEN'} → ${fields.who || 'OPEN'})` : ''}`, 'ai');
+      return `Staged draft edit on ${s.date} ${s.start}–${s.end} ${s.pos}: ${JSON.stringify(fields)}. ${draftCount()} draft changes pending publish.`;
+    }
+    if (name === 'add_shift') {
+      const d = overlay.adminDraft;
+      const id = nextAddId();
+      d.added.push({ id, date: input.date, pos: input.pos, start: input.start, end: input.end, who: input.who || '', site: input.site, note: input.note || '' });
+      audit(`Copilot draft add — ${input.date} ${input.start}–${input.end} ${input.pos} (${input.who || 'OPEN'})`, 'ai');
+      return `Staged new draft shift ${id}. ${draftCount()} draft changes pending publish.`;
+    }
+    if (name === 'remove_shift') {
+      const s = adminShifts().find(x => x.id === input.id);
+      if (!s) return `No shift with id ${input.id}.`;
+      const d = overlay.adminDraft;
+      if (!d.removed.includes(input.id)) d.removed.push(input.id);
+      audit(`Copilot draft removal — ${describeShift(s)}`, 'ai');
+      return `Staged draft removal of ${s.date} ${s.start}–${s.end} ${s.pos}. ${draftCount()} draft changes pending publish.`;
+    }
+    if (name === 'set_tier') {
+      if (!['ft', 'pt', 'prn'].includes(input.tier)) return 'tier must be ft, pt, or prn';
+      overlay.tiers[input.who] = input.tier;
+      audit(`${input.who} employment tier set to ${TIER_LABEL[input.tier]} (via copilot)`, 'ai');
+      return `${input.who} is now ${TIER_LABEL[input.tier]}.`;
+    }
+    if (name === 'proposal_ops') {
+      const n = applyBackendOps(input.ops || []);
+      if (n) { g.result = runGeneration(g.site, g.month); g.applied = false; }
+      return n ? `Applied ${n} ops; proposal rebuilt: ${g.result.assignments.length}/${g.result.slots} filled.` : 'No ops matched — check names/fields.';
+    }
+    if (name === 'run_generation') {
+      if (input.site) g.site = input.site;
+      if (input.month) g.month = input.month;
+      g.result = runGeneration(g.site, g.month);
+      g.applied = false;
+      const under = g.result.underFloor.map(n2 => n2.replace(/,.*$/, '')).join(', ');
+      return `Proposal for ${siteName(g.site)} ${g.month}: ${g.result.assignments.length}/${g.result.slots} filled, ${g.result.unfilled.length} open.` +
+        (under ? ` Below floor: ${under}.` : ' Everyone at/above their floor.') + '\nLoads: ' +
+        [...g.result.stats.values()].filter(s => s.assigned).sort((a, b) => b.assigned - a.assigned).map(s => `${s.who.replace(/,.*$/, '')} ${s.assigned}/${s.target}`).join(', ');
+    }
+    if (name === 'get_drafts') {
+      const d = overlay.adminDraft;
+      const edits = Object.entries(d.edits).map(([id, f]) => `edit ${id}: ${JSON.stringify(f)}`);
+      const adds = d.added.map(a => `add ${a.id}: ${a.date} ${a.start}–${a.end} ${a.pos} (${a.who || 'OPEN'})`);
+      const rems = d.removed.map(id => `remove ${id}`);
+      return [...edits, ...adds, ...rems].join('\n') || 'No draft changes staged.';
+    }
+    if (name === 'discard_drafts') {
+      const n = draftCount();
+      overlay.adminDraft = { edits: {}, added: [], removed: [] };
+      audit(`Copilot discarded ${n} draft changes (user request)`, 'ai');
+      return `Discarded ${n} draft changes.`;
+    }
+    if (name === 'publish_drafts') {
+      const n = draftCount();
+      if (!n) return 'Nothing to publish — no draft changes staged.';
+      publishDraft();
+      return `Published ${n} changes; affected staff notified in the employee app.`;
+    }
+    if (name === 'get_audit') {
+      return (overlay.audit || []).slice(0, Math.min(input.limit || 20, 50)).map(a => `${a.created || ''} [${a.kind || 'log'}] ${a.text}`).join('\n') || 'Audit log is empty.';
+    }
+    return `Unknown tool ${name}.`;
+  } catch (err) {
+    return `Tool error: ${String(err.message || err)}`;
+  }
+}
+
+let agentConvo = [];   // in-memory conversation (API format); resets each login/reload
+
+function agentSystemPrompt() {
+  const g = state.gen;
+  return [
+    `You are the scheduling copilot for Relias Healthcare's MyReliasSchedule console (currently viewing ${siteName(g.site)}, ${g.month}). The user is the scheduler; help with ANYTHING schedule-related: answer questions, analyze coverage/fairness, and make changes.`,
+    `You have full control through your tools. Read before you write: check the schedule/roster with get_schedule/get_providers rather than assuming. Shift edits stage as DRAFTS the staff can't see; tell the user drafts are pending and that they (or you, if they say so) must publish. Only call publish_drafts or discard_drafts when the user explicitly asks.`,
+    `House rules you must respect and can explain: nobody ends a month below their average minus one (PRN exempt); nobody above target+1; ≥10h rest between shifts; one shift/day; max-consecutive-days rule; keep people on their usual time of day; hierarchy full-time > part-time > PRN.`,
+    `Site codes: ${Object.entries(SITE_NAMES).map(([c, n]) => `${c}=${n}`).join(', ')}.`,
+    `Be concise and concrete — cite names, dates, and counts from tool results. If a request is ambiguous, ask.`,
+  ].join('\n\n');
+}
+
+async function runAgentChat(text) {
+  const g = state.gen;
+  agentConvo.push({ role: 'user', content: text });
+  if (agentConvo.length > 40) agentConvo = agentConvo.slice(-30);
+  let mutated = false;
+  const MUTATING = new Set(['update_shift', 'add_shift', 'remove_shift', 'set_tier', 'proposal_ops', 'run_generation', 'discard_drafts', 'publish_drafts']);
+  for (let hop = 0; hop < 8; hop++) {
+    const data = await backendCall('/api/agent', { system: agentSystemPrompt(), messages: agentConvo, tools: AGENT_TOOLS });
+    agentConvo.push({ role: 'assistant', content: data.content });
+    const textParts = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    if (textParts) pushChat('ai', textParts);
+    const calls = (data.content || []).filter(b => b.type === 'tool_use');
+    if (!calls.length || data.stop_reason !== 'tool_use') break;
+    const results = [];
+    for (const c of calls) {
+      pushChat('tool', `🔧 ${c.name}(${JSON.stringify(c.input).slice(0, 120)})`);
+      if (MUTATING.has(c.name)) mutated = true;
+      results.push({ type: 'tool_result', tool_use_id: c.id, content: agentToolExec(c.name, c.input || {}) });
+    }
+    agentConvo.push({ role: 'user', content: results });
+    saveOverlay();
+    render();   // live progress — user watches the tools fire
+  }
+  return mutated;
 }
 
 function renderScheduleChat(wrap) {
@@ -1914,14 +2332,14 @@ function renderScheduleChat(wrap) {
   const on = backendOn();
   cardHeader(box, '💬 Talk to the schedule', on ? '🔌 Claude connected' : '🔌 Connect Claude', openBackendDialog);
   box.append(el('div', 'reqhint', on
-    ? 'Connected to Opus 4.8 — type roster and rule changes in plain English, any phrasing. Falls back to the in-browser parser if the backend is unreachable.'
-    : 'Free-type roster and rule changes — new providers, removals, days off, caps, "nights only", or moves after generating. Parsed in-browser now; connect the Claude backend to run this on Opus 4.8.'));
+    ? 'Opus 4.8 with full control — ask anything schedule-related or tell it what to change: shifts, drafts, tiers, rules, whole-month generation. Shift changes stage as drafts until published.'
+    : 'Free-type roster and rule changes — parsed in-browser now; connect the Claude backend for the full copilot.'));
   const log = el('div', 'chatlog');
   const msgs = overlay.genChat || [];
   if (!msgs.length) {
-    log.append(el('div', 'chatmsg ai', 'Hi! Tell me about roster or rule changes in plain English — e.g. "We have a new physician, Dr. Sarah Chen, starting in September — nights only, about 12 shifts a month."'));
+    log.append(el('div', 'chatmsg ai', 'Hi! I can see and change everything here — ask me things like "who covers Northport nights the week of Sep 14?", "swap Blake\'s Sep 22 to Kristin", "why is Tupelo short?", or "build October and publish it."'));
   }
-  for (const m of msgs.slice(-20)) log.append(el('div', 'chatmsg ' + (m.from === 'you' ? 'you' : 'ai'), m.text));
+  for (const m of msgs.slice(-30)) log.append(el('div', 'chatmsg ' + (m.from === 'you' ? 'you' : m.from === 'tool' ? 'tool' : 'ai'), m.text));
   box.append(log);
   const form = el('form', 'chatform');
   const inp = el('input');
@@ -1936,31 +2354,12 @@ function renderScheduleChat(wrap) {
     if (!text) return;
     pushChat('you', text);
     if (backendOn()) {
-      pushChat('ai', '…');
       g.chatFocus = true;
       saveOverlay();
       render();
       try {
-        const ctx = { text, site: g.site, siteName: siteName(g.site), month: g.month,
-          people: [...new Set(base.map(s => s.who).filter(Boolean))],
-          pool: poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, target: p.target, tod: p.tod || null, tier: tierOf(p.who, p.float) })) };
-        const data = await backendCall('/api/chat', ctx);
-        const n = applyBackendOps(data.ops);
-        let tail = '';
-        if (n) {
-          /* always rebuild the proposal so every change is visible immediately —
-             including the first chat message before Generate was ever clicked */
-          const hadStaleDrafts = g.applied;
-          g.result = runGeneration(g.site, g.month);
-          g.applied = false;
-          tail = ` (proposal updated: ${g.result.assignments.length}/${g.result.slots} filled)`;
-          if (hadStaleDrafts) tail += ' ⚠ You had already applied the old proposal as drafts — hit "Apply as drafts" again to update them.';
-        } else if ((data.ops || []).length) {
-          tail = ' ⚠ I got operations back but none matched a provider/rule here — try the exact name from the roster.';
-        }
-        overlay.genChat[overlay.genChat.length - 1].text = (data.reply || 'Done.') + tail;
+        await runAgentChat(text);
       } catch (err) {
-        overlay.genChat.pop();   // drop the "…" placeholder
         pushChat('ai', `Claude backend error (${String(err.message || err)}). Using the in-browser parser instead: ` + handleCommand(text).reply);
       }
     } else {
@@ -1982,7 +2381,7 @@ function renderScheduleChat(wrap) {
       x.title = 'Undo this change';
       x.onclick = () => {
         overlay.genAdjust = overlay.genAdjust.filter(z => z.id !== a.id);
-        g.result = runGeneration(g.site, g.month); g.applied = false;
+        rebuildProposal(g.site, g.month);
         pushChat('ai', `Undid: ${a.summary}.`);
         saveOverlay();
         render();
@@ -2149,7 +2548,7 @@ function openRequestEditor(initialWho) {
         addAdjust('setRequest', { who: edit.who, mo, off, prefer, cap, note: edit.note.trim() },
           `${edit.who.replace(/,.*$/, '')} requests set (${off.length} off · ${prefer.length} prefer${cap ? ` · cap ${cap}` : ''})`, site);
         audit(`Requests editor: set ${edit.who} for ${fmtMonth(mo)} — ${off.length} off, ${prefer.length} prefer${cap ? `, cap ${cap}` : ''}`, 'ai');
-        g.result = runGeneration(site, mo); g.applied = false;
+        rebuildProposal(site, mo);
         saveOverlay();
         close();
         render();
@@ -2189,7 +2588,7 @@ function openRulesDialog() {
         overlay.genAdjust = overlay.genAdjust.filter(a => a.kind !== 'maxRun');
         addAdjust('maxRun', { value: n }, `max ${n} in a row (all sites)`, '*');
         audit(`Rules dialog: max ${n} consecutive days`, 'ai');
-        g.result = runGeneration(site, mo); g.applied = false;
+        rebuildProposal(site, mo);
         saveOverlay();
         paint();
       };
@@ -2223,7 +2622,7 @@ function openRulesDialog() {
         else if (kind === 'cap') { addAdjust('setCap', { who, value: n }, `${first} capped at ${n}`, site); audit(`Rules dialog: capped ${who} at ${n}`, 'ai'); }
         else if (kind === 'target') { addAdjust('setTarget', { who, value: n }, `${first} target ${n}/mo`, site); audit(`Rules dialog: ${who} target ${n}`, 'ai'); }
         else { addAdjust('setTimeOfDay', { who, tod: kind }, `${first} → ${kind}s only`, site); audit(`Rules dialog: ${who} ${kind} only`, 'ai'); }
-        g.result = runGeneration(site, mo); g.applied = false;
+        rebuildProposal(site, mo);
         saveOverlay();
         paint();
       };
@@ -2244,7 +2643,7 @@ function openRulesDialog() {
           x.type = 'button';
           x.onclick = () => {
             overlay.genAdjust = overlay.genAdjust.filter(z => z.id !== a.id);
-            g.result = runGeneration(site, mo); g.applied = false;
+            rebuildProposal(site, mo);
             saveOverlay();
             paint();
           };
@@ -2431,36 +2830,41 @@ async function stageGenerateClaude() {
   g.running = true; g.result = null; g.applied = false; g.showEmails = false; g.expanded = new Set();
   g.claudeTargets = null; g.claudeKey = null; g.claudePlan = null; g.review = null;
   render();
-  const steps = ['Sending provider history and requests to Opus 4.8…', 'Opus 4.8 is reading the requests and setting targets…', 'Placing shifts with the rule engine…'];
+  rebuildSeq++;   // invalidate any in-flight background rebuild
+  const steps = ['Sending the roster and requests to Opus 4.8…', 'Opus 4.8 is reading the month…', 'HiGHS optimizer is placing the shifts…'];
   let i = 0;
   const tick = () => { const e = document.getElementById('genStatus'); if (e && i < steps.length) { e.textContent = steps[i++]; setTimeout(tick, 900); } };
   tick();
-  try {
-    const profiles = timeProfiles();
-    /* send each provider's EFFECTIVE baseline as their average: real worked
-       average when it's a credible signal, otherwise the planned-roster target.
-       Sending the raw noisy average (e.g. 2 stray days at a forecast site) made
-       Opus "honor" a phantom tiny load and lowball everyone. */
-    const providers = poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, avg: p.fromAvg && p.avg ? p.avg : p.target, usual: usualShift(profiles.get(p.who)), tier: tierOf(p.who, p.float) }));
-    const reqs = [...requestsFor(g.site, g.month).values()]
-      .filter(r => providers.some(p => p.who === r.who) || r.source === 'example')
-      .map(r => ({ who: r.who, off: [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), prefer: [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), cap: r.cap, note: r.note }));
-    const openSlots = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
-    const maxRun = (genAdjustFor(g.site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
-    const data = await backendCall('/api/generate', {
+  const profiles = timeProfiles();
+  /* send each provider's EFFECTIVE baseline as their average: real worked
+     average when it's a credible signal, otherwise the planned-roster target.
+     Sending the raw noisy average (e.g. 2 stray days at a forecast site) made
+     Opus "honor" a phantom tiny load and lowball everyone. */
+  const providers = poolFor(g.site, g.month).map(p => ({ who: p.who, role: p.role, avg: p.fromAvg && p.avg ? p.avg : p.target, usual: usualShift(profiles.get(p.who)), tier: tierOf(p.who, p.float) }));
+  const reqs = [...requestsFor(g.site, g.month).values()]
+    .filter(r => providers.some(p => p.who === r.who) || r.source === 'example')
+    .map(r => ({ who: r.who, off: [...r.off].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), prefer: [...r.prefer].filter(d => d.startsWith(g.month)).map(d => +d.slice(8)), cap: r.cap, note: r.note }));
+  const openSlots = adminShifts().filter(s => s.site === g.site && s.date.startsWith(g.month) && !s.who && slotRole(s.pos) !== 'SKIP').length;
+  const maxRun = (genAdjustFor(g.site).slice().reverse().find(a => a.kind === 'maxRun') || {}).value || 5;
+  /* Opus writes the narrative; the optimizer owns the placement AND the numbers.
+     (/api/generate still returns targets for older clients, but they are no
+     longer applied — asking a language model to pick twenty interacting
+     integers is exactly the job the MILP provably does better.) */
+  const [plan, res] = await Promise.allSettled([
+    backendCall('/api/generate', {
       site: g.site, siteName: siteName(g.site), month: g.month, historyMonths: HIST_MONTHS.length,
       openSlots, providers, requests: reqs, rules: `no more than ${maxRun} consecutive days; at least 10h between shifts; keep night providers on nights`,
-    });
-    g.claudeTargets = new Map((data.targets || []).filter(t => t.who && t.target).map(t => [t.who, t.target]));
-    g.claudeKey = `${g.site}|${g.month}`;
-    g.claudePlan = { analysis: data.analysis, notes: data.notes || [], targetCount: (data.targets || []).length };
-    g.result = runGeneration(g.site, g.month);
-    audit(`Opus 4.8 generated the ${fmtMonth(g.month)} plan for ${siteName(g.site)} — ${g.claudePlan.targetCount} provider targets`, 'ai');
-  } catch (err) {
-    g.claudePlan = { error: String(err.message || err) };
-    g.result = runGeneration(g.site, g.month);   // graceful fallback to the local engine
-    audit(`Claude backend call failed (${String(err.message || err)}); used the built-in engine instead`, 'ai');
+    }),
+    runGenerationBest(g.site, g.month),
+  ]);
+  if (plan.status === 'fulfilled') {
+    g.claudePlan = { analysis: plan.value.analysis, notes: plan.value.notes || [] };
+    audit(`Opus 4.8 analyzed ${fmtMonth(g.month)} at ${siteName(g.site)}; the HiGHS optimizer placed the shifts`, 'ai');
+  } else {
+    g.claudePlan = { error: String((plan.reason && plan.reason.message) || plan.reason) };
+    audit(`Claude backend call failed (${g.claudePlan.error}); the proposal was still generated locally`, 'ai');
   }
+  g.result = res.status === 'fulfilled' ? res.value : runGeneration(g.site, g.month);
   g.running = false;
   saveOverlay();
   render();
@@ -2525,7 +2929,7 @@ async function runAdversarialReview() {
       let applied = 0;
       if (poolOps.length) {
         applied += applyBackendOps(poolOps);
-        if (applied) { g.result = runGeneration(g.site, g.month); g.applied = false; }
+        if (applied) { g.result = await runGenerationBest(g.site, g.month); g.applied = false; }
       }
       if (moves.length) applied += applyBackendOps(moves);
       entry.fixesApplied = applied;
@@ -2776,7 +3180,7 @@ function renderGenerate(main) {
         for (const n of notes) ul.append(el('li', '', n));
         cp.append(ul);
       }
-      cp.append(el('div', 'reqhint', `Opus 4.8 set ${g.claudePlan.targetCount} provider targets from the history and requests; the rule engine below placed the shifts so every hard rule holds.`));
+      cp.append(el('div', 'reqhint', 'Opus 4.8 read the roster and requests and wrote this analysis; the HiGHS optimizer placed the shifts, so every hard rule holds by construction.'));
     }
     wrap.append(cp);
   }
@@ -2791,6 +3195,10 @@ function renderGenerate(main) {
     kpis.append(kpi(res.offDays, 'Days-off honored (all of them)', 'ok'));
     kpis.append(kpi(`${res.preferGot}/${res.preferTotal}`, 'Preferred days granted', ''));
     wrap.append(kpis);
+
+    wrap.append(el('div', 'reqhint enginebadge', res.engine === 'milp'
+      ? `⚙ Placed by the HiGHS optimizer — mixed-integer model with ${res.solver.vars.toLocaleString()} decision variables and ${res.solver.rows.toLocaleString()} constraints, solved in-browser in ${(res.solver.ms / 1000).toFixed(1)}s (${res.solver.status === 'Optimal' ? 'proven optimal' : res.solver.status}).`
+      : '⚙ Placed by the built-in greedy engine — instant preview; the HiGHS optimizer replaces it in the background when available.'));
 
     /* proposed month at a glance */
     renderProposalCalendar(wrap, res);
@@ -2853,8 +3261,7 @@ function renderGenerate(main) {
         overlay.tiers[s.who] = tierSel.value;
         audit(`${s.who} employment tier set to ${TIER_LABEL[tierSel.value]}`, 'ai');
         saveOverlay();
-        g.result = runGeneration(g.site, g.month);
-        g.applied = false;
+        rebuildProposal(g.site, g.month);
         render();
       };
       tdT.append(tierSel);

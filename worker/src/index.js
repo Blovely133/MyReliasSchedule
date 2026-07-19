@@ -189,6 +189,42 @@ async function handleGenerate(env, payload) {
   return { analysis: input.analysis || '', notes, targets, usage };
 }
 
+/* ---- /api/agent: open-ended copilot loop ----
+ * The console sends the running conversation plus client-defined tools; Opus
+ * answers or calls tools, the BROWSER executes them against its local data and
+ * posts the results back for the next turn. The Worker stays a thin, keyless
+ * relay: model pinned, sizes capped, key never leaves the server. */
+
+async function handleAgent(env, payload) {
+  const { system, messages, tools } = payload;
+  if (!Array.isArray(messages) || !messages.length) throw new Error('messages array required');
+  if (messages.length > 80) throw new Error('conversation too long — start a new chat');
+  if (JSON.stringify(messages).length > 400000) throw new Error('conversation too large — start a new chat');
+  const body = {
+    model: MODEL,
+    max_tokens: 4096,
+    system: String(system || '').slice(0, 20000),
+    messages,
+    output_config: { effort: 'high' },
+  };
+  if (Array.isArray(tools) && tools.length) body.tools = tools.slice(0, 16);
+  const res = await fetch(ANTHROPIC_URL, {
+    method: 'POST',
+    headers: {
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Anthropic ${res.status}: ${text.slice(0, 400)}`);
+  }
+  const data = await res.json();
+  return { content: data.content, stop_reason: data.stop_reason, usage: data.usage };
+}
+
 /* ---- /api/review: adversarial review of a proposed schedule ---- */
 
 const REVIEW_TOOL = {
@@ -313,6 +349,7 @@ export default {
       if (url.pathname === '/api/chat') return json(await handleChat(env, payload), 200, origin);
       if (url.pathname === '/api/generate') return json(await handleGenerate(env, payload), 200, origin);
       if (url.pathname === '/api/review') return json(await handleReview(env, payload), 200, origin);
+      if (url.pathname === '/api/agent') return json(await handleAgent(env, payload), 200, origin);
       return json({ error: 'not_found' }, 404, origin);
     } catch (err) {
       return json({ error: 'upstream', message: String(err.message || err) }, 502, origin);
